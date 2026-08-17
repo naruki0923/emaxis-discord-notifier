@@ -1,0 +1,40 @@
+name: debug
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: probe
+        run: |
+          set +e
+          UA_BROWSER="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+          API="https://www.am.mufg.jp/mukamapi/fund_details/?fund_cd=253266"
+
+          echo "== 1. api / default UA"
+          curl -s -o /dev/null -w "%{http_code}\n" "$API"
+
+          echo "== 2. api / browser UA"
+          curl -s -o /dev/null -w "%{http_code}\n" -A "$UA_BROWSER" "$API"
+
+          echo "== 3. api / browser UA + referer + lang"
+          curl -s -o /dev/null -w "%{http_code}\n" -A "$UA_BROWSER" \
+            -H "Accept: application/json, text/plain, */*" \
+            -H "Accept-Language: ja,en;q=0.9" \
+            -H "Referer: https://emaxis.am.mufg.jp/fund/253266.html" \
+            "$API"
+
+          echo "== 4. fund html page"
+          curl -s -o /dev/null -w "%{http_code}\n" -A "$UA_BROWSER" \
+            "https://emaxis.am.mufg.jp/fund/253266.html"
+
+          echo "== 5. toushin.or.jp"
+          curl -s -o /dev/null -w "%{http_code}\n" -A "$UA_BROWSER" \
+            "https://toushin-lib.fwg.ne.jp/FdsWeb/FDST030000/csv-file-download?isinCd=JP90C000H1T1&associFundCd=03311187"
+
+          echo "== 6. runner egress ip"
+          curl -s https://api.ipify.org; echo
+          curl -s "http://ip-api.com/json/?fields=country,isp" ; echo
