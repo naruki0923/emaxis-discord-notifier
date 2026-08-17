@@ -22,19 +22,23 @@ ghコマンドの場合:
 
 ```sh
 gh secret set DISCORD_WEBHOOK_URL
-gh secret set PORTFOLIO_UNITS
-gh secret set PORTFOLIO_ACQUISITION_AMOUNT
+./update.sh <保有口数> <取得金額>
 ```
 
 保有情報はリポジトリに含めず、Secretsだけに保存します（`portfolio.json` は `.gitignore` 済み）。
 
 ## 保有口数・取得金額の更新
 
-SBI証券の最新表示に合わせて、Secretsの値を入れ直します。
+追加購入または売却をしたら、SBI証券の最新表示の値をそのまま渡します。桁区切りのカンマや「口」「円」は付いていても構いません。
 
 ```sh
-gh secret set PORTFOLIO_UNITS
-gh secret set PORTFOLIO_ACQUISITION_AMOUNT
+./update.sh 2,402 12,000
+```
+
+GitHub Secretsとローカルの `portfolio.json` の両方を更新し、更新後の評価額をその場で表示します。反映は次回の朝8時の通知からです。すぐにDiscordへ送って確認したい場合:
+
+```sh
+./update.sh 2,402 12,000 --notify
 ```
 
 ## 手動実行と確認
