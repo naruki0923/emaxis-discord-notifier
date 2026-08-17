@@ -1,0 +1,29 @@
+name: Discord通知
+
+on:
+  schedule:
+    # 23:00 UTC = 翌日 8:00 JST（毎日）
+    - cron: "0 23 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: emaxis-notify
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 基準価額を取得してDiscordへ通知
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PORTFOLIO_UNITS: ${{ secrets.PORTFOLIO_UNITS }}
+          PORTFOLIO_ACQUISITION_AMOUNT: ${{ secrets.PORTFOLIO_ACQUISITION_AMOUNT }}
+        run: python3 notifier.py
