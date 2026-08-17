@@ -1,7 +1,7 @@
 import unittest
 from decimal import Decimal
 
-from notifier import FundPrice, Portfolio, build_discord_payload
+from notifier import FundPrice, NotifierError, Portfolio, build_discord_payload, parse_toushin_csv
 
 
 class FundPriceTest(unittest.TestCase):
@@ -33,6 +33,30 @@ class FundPriceTest(unittest.TestCase):
         self.assertEqual(fields[2]["value"], "**10,069円**")
         self.assertEqual(fields[3]["value"], "**+67円**")
         self.assertEqual(fields[4]["value"], "**+69円（+0.69%）**")
+
+
+class ToushinCsvTest(unittest.TestCase):
+    CSV = (
+        "年月日,基準価額(円),純資産総額（百万円）,分配金,決算日\n"
+        "2026年08月12日,45301,12840276,,\n"
+        "2026年08月13日,45424,12910623,,\n"
+        "2026年08月14日,45727,13011097,,\n"
+    )
+
+    def test_uses_last_two_rows(self):
+        price = parse_toushin_csv(self.CSV)
+        self.assertEqual(price.date, "2026年08月14日")
+        self.assertEqual(price.price, 45_727)
+        self.assertEqual(price.change, 303)
+
+    def test_ignores_trailing_blank_and_broken_rows(self):
+        price = parse_toushin_csv(self.CSV + "\n,,,,\n2026年08月17日,,,,\n")
+        self.assertEqual(price.date, "2026年08月14日")
+        self.assertEqual(price.change, 303)
+
+    def test_rejects_insufficient_rows(self):
+        with self.assertRaises(NotifierError):
+            parse_toushin_csv("年月日,基準価額(円)\n2026年08月14日,45727\n")
 
 
 if __name__ == "__main__":

@@ -21,6 +21,13 @@ FUND_CODE = "253266"
 FUND_NAME = "eMAXIS Slim 米国株式（S&P500）"
 FUND_URL = f"https://emaxis.am.mufg.jp/fund/{FUND_CODE}.html"
 API_URL = f"https://www.am.mufg.jp/mukamapi/fund_details/?fund_cd={FUND_CODE}"
+# 三菱UFJ側は国外・データセンターのIPを拒否するため、投資信託協会の公開データを代替に使う。
+TOUSHIN_ISIN = "JP90C000H1T1"
+TOUSHIN_FUND_CODE = "03311187"
+TOUSHIN_CSV_URL = (
+    "https://toushin-lib.fwg.ne.jp/FdsWeb/FDST030000/csv-file-download"
+    f"?isinCd={TOUSHIN_ISIN}&associFundCd={TOUSHIN_FUND_CODE}"
+)
 KEYCHAIN_SERVICE = "emaxis-discord-notifier"
 KEYCHAIN_ACCOUNT = "discord-webhook-url"
 USER_AGENT = "emaxis-discord-notifier/1.0"
@@ -36,6 +43,7 @@ class FundPrice:
     date: str
     price: int
     change: int
+    source: str = "三菱UFJアセットマネジメント公式サイト"
 
     @property
     def previous_price(self) -> int:
@@ -72,9 +80,15 @@ class Portfolio:
         return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
-def request_json(url: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> Any:
+def request_bytes(
+    url: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    accept: str = "application/json",
+) -> bytes:
     data = None
-    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    headers = {"User-Agent": USER_AGENT, "Accept": accept}
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -84,19 +98,77 @@ def request_json(url: str, *, method: str = "GET", payload: dict[str, Any] | Non
     for attempt in range(3):
         try:
             with urllib.request.urlopen(request, timeout=20) as response:
-                body = response.read()
-                if not body:
-                    return None
-                return json.loads(body.decode("utf-8"))
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
+                return response.read()
+        except urllib.error.HTTPError as exc:
             last_error = exc
-            if attempt < 2:
-                time.sleep(2**attempt)
+            # 拒否や不在は繰り返しても結果が変わらないため、すぐ次の取得先へ移る。
+            if 400 <= exc.code < 500 and exc.code != 429:
+                break
+        except (urllib.error.URLError, TimeoutError) as exc:
+            last_error = exc
+        if attempt < 2:
+            time.sleep(2**attempt)
 
-    raise NotifierError(f"通信に3回失敗しました: {last_error}")
+    raise NotifierError(f"通信に失敗しました: {last_error}")
+
+
+def request_json(url: str, *, method: str = "GET", payload: dict[str, Any] | None = None) -> Any:
+    body = request_bytes(url, method=method, payload=payload)
+    if not body:
+        return None
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise NotifierError(f"応答をJSONとして解釈できませんでした: {exc}") from exc
+
+
+def parse_toushin_csv(text: str) -> FundPrice:
+    rows: list[tuple[str, int]] = []
+    for line in text.splitlines()[1:]:
+        columns = line.split(",")
+        if len(columns) < 2:
+            continue
+        date_raw = columns[0].strip()
+        price_raw = columns[1].strip().replace(",", "")
+        if not date_raw or not price_raw.isdigit():
+            continue
+        rows.append((date_raw, int(price_raw)))
+
+    if len(rows) < 2:
+        raise NotifierError("投資信託協会のデータに基準価額が2営業日分ありません。")
+
+    date, price = rows[-1]
+    _, previous_price = rows[-2]
+    return FundPrice(
+        date=date,
+        price=price,
+        change=price - previous_price,
+        source="投資信託協会 投信総合検索ライブラリー",
+    )
+
+
+def fetch_fund_price_from_toushin() -> FundPrice:
+    body = request_bytes(TOUSHIN_CSV_URL, accept="text/csv,*/*")
+    try:
+        text = body.decode("cp932")
+    except UnicodeDecodeError as exc:
+        raise NotifierError("投資信託協会のCSVを解読できませんでした。") from exc
+    return parse_toushin_csv(text)
 
 
 def fetch_fund_price() -> FundPrice:
+    try:
+        return fetch_fund_price_from_mufg()
+    except NotifierError as mufg_error:
+        try:
+            return fetch_fund_price_from_toushin()
+        except NotifierError as toushin_error:
+            raise NotifierError(
+                f"基準価額を取得できませんでした（公式サイト: {mufg_error} / 投資信託協会: {toushin_error}）"
+            ) from toushin_error
+
+
+def fetch_fund_price_from_mufg() -> FundPrice:
     response = request_json(API_URL)
     if not isinstance(response, dict) or response.get("result", {}).get("status") != 200:
         raise NotifierError("公式APIから正常な応答を取得できませんでした。")
@@ -241,7 +313,7 @@ def build_discord_payload(price: FundPrice, portfolio: Portfolio | None = None) 
                 "color": color,
                 "fields": fields,
                 "footer": {
-                    "text": "出所: 三菱UFJアセットマネジメント公式サイト（過去の実績であり、将来の成果を保証しません）"
+                    "text": f"出所: {price.source}（過去の実績であり、将来の成果を保証しません）"
                 },
             }
         ],
