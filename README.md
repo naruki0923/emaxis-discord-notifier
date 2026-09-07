@@ -15,8 +15,8 @@
 | Secret名 | 内容 |
 | --- | --- |
 | `DISCORD_WEBHOOK_URL` | コピーしたDiscord Webhook URL |
-| `PORTFOLIO_UNITS` | 保有口数（例: `2202`） |
-| `PORTFOLIO_ACQUISITION_AMOUNT` | 取得金額（円、例: `10000`） |
+| `PORTFOLIO_UNITS` | 保有口数 |
+| `PORTFOLIO_ACQUISITION_AMOUNT` | 取得金額（円） |
 
 ghコマンドの場合:
 
@@ -60,7 +60,7 @@ gh run list --workflow=notify.yml
 Discordへ送らず取得結果だけを見る場合:
 
 ```sh
-PORTFOLIO_UNITS=2202 PORTFOLIO_ACQUISITION_AMOUNT=10000 python3 notifier.py --dry-run
+PORTFOLIO_UNITS=<保有口数> PORTFOLIO_ACQUISITION_AMOUNT=<取得金額> python3 notifier.py --dry-run
 ```
 
 `portfolio.json` を置いておくと、環境変数がなくてもその値が使われます（環境変数が優先）。
