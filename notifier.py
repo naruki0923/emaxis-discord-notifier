@@ -166,15 +166,15 @@ class FundReport:
     price: FundPrice
     portfolio: Portfolio | None = None
     purchases: tuple[Purchase, ...] = field(default_factory=tuple)
+    # 基準日に約定した口数（SBI証券の表示に反映済みかどうかを問わない）。前営業日には持っていない。
+    same_day_units: int = 0
 
     def daily_change(self) -> int:
         """保有分の前営業日比。基準日に約定した口数は前営業日に持っていないので除く。"""
         if self.portfolio is None:
             return 0
-        price_date = parse_japanese_date(self.price.date)
-        new_units = sum(p.units for p in self.purchases if p.trade_date >= price_date)
-        held = Portfolio(self.portfolio.units - new_units, self.portfolio.acquisition_amount)
-        return held.daily_change(self.price)
+        held_units = max(self.portfolio.units - self.same_day_units, 0)
+        return Portfolio(held_units, self.portfolio.acquisition_amount).daily_change(self.price)
 
 
 def request_bytes(
@@ -255,6 +255,8 @@ def parse_toushin_csv(text: str) -> FundPrice:
     )
 
 
+# 価格の代替取得と過去の基準価額で同じCSVを使うため、1回の実行で1度だけ取りに行く。
+@lru_cache(maxsize=None)
 def fetch_toushin_text(fund: Fund) -> str:
     body = request_bytes(fund.toushin_csv_url, accept="text/csv,*/*")
     try:
@@ -358,37 +360,51 @@ def schedule_order(fund: Fund, requested: date, amount: int) -> Purchase:
     return Purchase(order_date, trade_date, settlement_date, amount)
 
 
-def estimate_purchases(
-    fund: Fund, holding: Holding, history: list[tuple[date, int]], until: date
-) -> list[Purchase]:
-    """as_of より後に約定する積立・単発の買付を、申込日が until までの分だけ並べる。
-
-    約定日の基準価額が history にあれば price を埋める（口数を推定できる）。
-    まだ無いものは price=None の約定待ちとして返す。
-    """
-    if holding.as_of is None:
-        return []
-
+def scheduled_purchases(fund: Fund, holding: Holding, since: date, until: date) -> list[Purchase]:
+    """申込日が until まで、約定日が since 以降の積立・単発の買付を、日付だけ決めて並べる。"""
     requests = list(holding.orders)
     if holding.monthly_amount > 0:
-        year, month = holding.as_of.year, holding.as_of.month
+        # 前月の積立が休業日で繰り越され、since 以降に約定することがあるため前月から見る。
+        year, month = (since.year - 1, 12) if since.month == 1 else (since.year, since.month - 1)
         while date(year, month, 1) <= until:
             day = min(holding.monthly_day, calendar.monthrange(year, month)[1])
             requests.append((date(year, month, day), holding.monthly_amount))
             year, month = (year + 1, 1) if month == 12 else (year, month + 1)
 
+    purchases = [schedule_order(fund, requested, amount) for requested, amount in requests]
+    return sorted(
+        (p for p in purchases if p.order_date <= until and p.trade_date >= since),
+        key=lambda p: p.trade_date,
+    )
+
+
+def estimate_purchases(
+    fund: Fund,
+    holding: Holding,
+    history: list[tuple[date, int]],
+    until: date,
+    published_until: date | None = None,
+) -> list[Purchase]:
+    """SBI証券の表示にまだ入っていない積立・単発の買付を、申込日が until までの分だけ並べる。
+
+    SBI証券は約定日の翌日に保有へ反映するため、約定日が as_of 当日以降のものを対象にする。
+    約定日の基準価額が history にあれば price を埋める（口数を推定できる）。
+    まだ無いものは price=None の約定待ちとして返す。published_until（投資信託協会のデータの
+    最終日）以前なのに基準価額が無い約定日は、営業日の判定違いなのでエラーにする。
+    """
+    if holding.as_of is None:
+        return []
+
     prices = dict(history)
-    last_priced = max(prices) if prices else None
     purchases: list[Purchase] = []
-    for requested, amount in requests:
-        purchase = schedule_order(fund, requested, amount)
-        if purchase.order_date > until or purchase.trade_date <= holding.as_of:
-            continue
+    for purchase in scheduled_purchases(fund, holding, holding.as_of, until):
         price = prices.get(purchase.trade_date)
-        if price is None and last_priced is not None and last_priced > purchase.trade_date:
+        if price is None and published_until is not None and purchase.trade_date <= published_until:
             raise NotifierError(f"約定日 {purchase.trade_date} の基準価額が見つかりません。")
-        purchases.append(Purchase(purchase.order_date, purchase.trade_date, purchase.settlement_date, amount, price))
-    return sorted(purchases, key=lambda p: p.trade_date)
+        purchases.append(
+            Purchase(purchase.order_date, purchase.trade_date, purchase.settlement_date, purchase.amount, price)
+        )
+    return purchases
 
 
 def resolve_fund_key(name: str) -> str:
@@ -464,19 +480,38 @@ def build_report(fund: Fund, holding: Holding | None, today: date | None = None)
         return FundReport(fund, price)
 
     purchases: list[Purchase] = []
+    same_day_units = 0
     if (holding.monthly_amount > 0 or holding.orders) and holding.as_of is not None:
         today = today or datetime.now(JST).date()
-        # 投資信託協会のデータは公式サイトより1日遅れることがあるため、最新の基準価額を足しておく。
-        history = dict(fetch_price_history(fund))
-        history.setdefault(parse_japanese_date(price.date), price.price)
+        price_date = parse_japanese_date(price.date)
+        try:
+            published = fetch_price_history(fund)
+        except NotifierError as exc:
+            # 過去の基準価額が無くても、最新の基準価額で約定した分までは推定できる。
+            print(f"警告: {fund.name}: 過去の基準価額を取得できませんでした: {exc}", file=sys.stderr)
+            published = []
+        # 投資信託協会のデータは公式サイトより遅れることがあるため、最新の基準価額を足しておく。
+        history = dict(published)
+        history.setdefault(price_date, price.price)
         # 次回の約定待ちも --dry-run で見られるよう、少し先の申込まで並べる。
-        purchases = estimate_purchases(fund, holding, sorted(history.items()), today + timedelta(days=31))
+        purchases = estimate_purchases(
+            fund,
+            holding,
+            sorted(history.items()),
+            today + timedelta(days=31),
+            published_until=max((d for d, _ in published), default=None),
+        )
+        same_day_units = sum(
+            p.amount * 10_000 // price.price
+            for p in scheduled_purchases(fund, holding, price_date, price_date)
+            if p.trade_date == price_date
+        )
     priced = [p for p in purchases if p.price is not None]
     portfolio = Portfolio(
         units=holding.units + sum(p.units for p in priced),
         acquisition_amount=holding.acquisition_amount + sum(p.amount for p in priced),
     )
-    return FundReport(fund, price, portfolio, tuple(purchases))
+    return FundReport(fund, price, portfolio, tuple(purchases), same_day_units)
 
 
 def get_webhook_url() -> str:
@@ -518,8 +553,11 @@ def build_message(reports: list[FundReport], errors: list[tuple[Fund, str]] | No
     held = [r for r in reports if r.portfolio is not None]
     total = sum(r.portfolio.valuation(r.price) for r in held)
     invested = sum(r.portfolio.acquisition_amount for r in held)
+    # 取得に失敗した銘柄があるときは、合計がその銘柄を含まないことを明記する。
+    excluded = "・".join(fund.label for fund in FUNDS if fund.key in failed)
+    note = f"（{excluded}を除く）" if excluded else ""
 
-    assets = [f"全体資産：{total:,}円"]
+    assets = [f"全体資産：{total:,}円{note}"]
     changes: list[str] = []
     for fund in FUNDS:
         report = by_key.get(fund.key)
@@ -542,8 +580,8 @@ def build_message(reports: list[FundReport], errors: list[tuple[Fund, str]] | No
             *changes,
             "",
             "・損益",
-            f"投資金額：{invested:,}円",
-            f"資産：{total:,}円",
+            f"投資金額：{invested:,}円{note}",
+            f"資産：{total:,}円{note}",
         ]
     )
 

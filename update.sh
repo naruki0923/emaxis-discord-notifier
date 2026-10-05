@@ -41,19 +41,24 @@ if ! command -v gh >/dev/null 2>&1; then
 fi
 
 cd "$PROJECT_DIR"
-if ! python3 -c 'import holidays' 2>/dev/null; then
-  echo "休業日の判定に使うライブラリを入れます: python3 -m pip install --user -r requirements.txt"
-  python3 -m pip install --user -q -r requirements.txt
+# Homebrew などの Python は pip での直接インストールを拒否する（PEP 668）ため、専用の仮想環境に入れる。
+readonly PYTHON="$PROJECT_DIR/.venv/bin/python3"
+if [[ ! -x "$PYTHON" ]]; then
+  python3 -m venv "$PROJECT_DIR/.venv"
+fi
+if ! "$PYTHON" -c 'import holidays' 2>/dev/null; then
+  echo "休業日の判定に使うライブラリを .venv に入れます..."
+  "$PYTHON" -m pip install -q -r requirements.txt
 fi
 REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
 
-python3 portfolio_update.py "${ARGS[@]}"
+"$PYTHON" portfolio_update.py "${ARGS[@]}"
 gh secret set PORTFOLIO_JSON --repo "$REPO" < "$PORTFOLIO_PATH" >/dev/null
 
 echo "更新しました: $REPO"
 echo
 
-python3 notifier.py --dry-run
+"$PYTHON" notifier.py --dry-run
 
 if [[ "$NOTIFY" == "yes" ]]; then
   echo

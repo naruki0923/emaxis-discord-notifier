@@ -98,10 +98,14 @@ class MessageTest(unittest.TestCase):
         message = build_message(reports, [(ALLCOUNTRY, "通信に失敗しました")])
         self.assertIn("S＆P500：0円", message)
         self.assertIn("オルカン：取得できませんでした", message)
+        self.assertIn("全体資産：10,000円（オルカンを除く）", message)
+        self.assertIn("投資金額：10,000円（オルカンを除く）", message)
+        self.assertIn("資産：10,000円（オルカンを除く）", message)
 
         message = build_message(reports[:1] + [FundReport(ALLCOUNTRY, reports[0].price)])
         self.assertIn("オルカン：保有情報が未設定です", message)
-        self.assertIn("投資金額：10,000円", message)
+        self.assertIn("投資金額：10,000円\n", message)
+        self.assertNotIn("除く", message)
 
 
 class ScheduleOrderTest(unittest.TestCase):
@@ -166,9 +170,26 @@ class EstimatePurchasesTest(unittest.TestCase):
         )
 
     def test_skips_purchases_already_in_sbi_values(self):
-        holding = Holding(0, 0, date(2026, 10, 14), 5_000, 10)
+        # SBI証券は約定日の翌日に保有へ反映する
+        holding = Holding(0, 0, date(2026, 10, 15), 5_000, 10)
         purchases = estimate_purchases(ALLCOUNTRY, holding, self.HISTORY, date(2026, 10, 31))
         self.assertEqual(purchases, [])
+
+    def test_update_on_trade_date_still_counts_that_purchase(self):
+        holding = Holding(0, 0, date(2026, 10, 14), 5_000, 10)
+        purchases = estimate_purchases(ALLCOUNTRY, holding, self.HISTORY, date(2026, 10, 31))
+        self.assertEqual([p.trade_date for p in purchases], [date(2026, 10, 14)])
+
+        holding = Holding(0, 0, date(2026, 10, 6), orders=((date(2026, 10, 5), 10_000),))
+        purchases = estimate_purchases(ALLCOUNTRY, holding, self.HISTORY, date(2026, 10, 31))
+        self.assertEqual([p.trade_date for p in purchases], [date(2026, 10, 6)])
+
+    def test_previous_month_order_carried_over_past_as_of(self):
+        # 積立日30日: 12/30申込→12/31〜1/3休業→1/4約定。1/2時点の登録でも12月分を数える。
+        holding = Holding(0, 0, date(2027, 1, 2), 5_000, 30)
+        history = [(date(2026, 12, 30), 40_000), (date(2027, 1, 4), 40_100)]
+        purchases = estimate_purchases(SP500, holding, history, date(2027, 1, 10))
+        self.assertEqual([(p.order_date, p.trade_date) for p in purchases], [(date(2026, 12, 30), date(2027, 1, 4))])
 
     def test_waits_until_trade_price_is_published(self):
         holding = Holding(0, 0, date(2026, 10, 5), 5_000, 10)
@@ -179,7 +200,16 @@ class EstimatePurchasesTest(unittest.TestCase):
         holding = Holding(0, 0, date(2026, 10, 5), 5_000, 10)
         history = [h for h in self.HISTORY if h[0] != date(2026, 10, 14)] + [(date(2026, 10, 15), 1)]
         with self.assertRaises(NotifierError):
-            estimate_purchases(ALLCOUNTRY, holding, history, date(2026, 10, 31))
+            estimate_purchases(ALLCOUNTRY, holding, history, date(2026, 10, 31), published_until=date(2026, 10, 15))
+
+    def test_lagging_published_data_leaves_purchase_pending(self):
+        # 投資信託協会は10/9まで、公式サイトの最新は10/15。10/14約定分は約定待ちのまま。
+        holding = Holding(0, 0, date(2026, 10, 5), 5_000, 10)
+        history = self.HISTORY[:5] + [(date(2026, 10, 15), 37_400)]
+        purchases = estimate_purchases(
+            ALLCOUNTRY, holding, history, date(2026, 10, 31), published_until=date(2026, 10, 9)
+        )
+        self.assertEqual([(p.trade_date, p.price) for p in purchases], [(date(2026, 10, 14), None)])
 
     def test_no_estimate_without_plan(self):
         holding = Holding(units=1_000, acquisition_amount=5_000, as_of=date(2026, 10, 5))
@@ -236,6 +266,41 @@ class BuildReportTest(unittest.TestCase):
         self.assertEqual(report.portfolio, Portfolio(1_000 + 5_000 * 10_000 // 37_300, 10_000))
         # 約定した当日の口数は前営業日比に含めない
         self.assertEqual(report.daily_change(), 1_000 * 37_300 // 10_000 - 1_000 * 37_200 // 10_000)
+
+    def test_same_day_units_already_in_sbi_values(self):
+        # 10/14約定分を含むSBIの表示値を10/15に登録。基準日10/14の前営業日比にはその口数を含めない。
+        bought = 5_000 * 10_000 // 37_300
+        holding = Holding(1_000 + bought, 10_000, date(2026, 10, 15), 5_000, 10)
+        price = FundPrice(date="2026年10月14日", price=37_300, change=100)
+        with mock.patch.object(notifier, "fetch_fund_price", return_value=price), mock.patch.object(
+            notifier, "fetch_price_history", return_value=EstimatePurchasesTest.HISTORY
+        ):
+            report = notifier.build_report(ALLCOUNTRY, holding, today=date(2026, 10, 15))
+        self.assertEqual(report.portfolio, Portfolio(1_000 + bought, 10_000))
+        self.assertEqual(report.daily_change(), 1_000 * 37_300 // 10_000 - 1_000 * 37_200 // 10_000)
+
+    def test_history_failure_still_reports_fund(self):
+        holding = Holding(1_000, 5_000, date(2026, 10, 5), 5_000, 10)
+        price = FundPrice(date="2026年10月14日", price=37_300, change=100)
+        with mock.patch.object(notifier, "fetch_fund_price", return_value=price), mock.patch.object(
+            notifier, "fetch_price_history", side_effect=NotifierError("通信に失敗しました")
+        ), mock.patch("sys.stderr"):
+            report = notifier.build_report(ALLCOUNTRY, holding, today=date(2026, 10, 15))
+        # 最新の基準価額（10/14）で約定した分は推定できる
+        self.assertEqual(report.portfolio, Portfolio(1_000 + 5_000 * 10_000 // 37_300, 10_000))
+
+
+class ToushinFetchTest(unittest.TestCase):
+    def test_csv_is_downloaded_once_per_fund(self):
+        notifier.fetch_toushin_text.cache_clear()
+        csv = ToushinCsvTest.CSV.encode("cp932")
+        with mock.patch.object(notifier, "request_bytes", return_value=csv) as request, mock.patch.object(
+            notifier, "fetch_fund_price_from_mufg", side_effect=NotifierError("403")
+        ):
+            notifier.fetch_fund_price(SP500)
+            notifier.fetch_price_history(SP500)
+        notifier.fetch_toushin_text.cache_clear()
+        self.assertEqual(request.call_count, 1)
 
 
 class ToushinCsvTest(unittest.TestCase):

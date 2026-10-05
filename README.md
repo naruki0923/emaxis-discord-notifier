@@ -81,7 +81,9 @@ SBI証券の表示に反映される前（約定前）でも、`--buy` で申込
 
 - 取得金額: 1回ごとに申込金額を加算
 - 保有口数: `申込金額 × 1万 ÷ 約定日の基準価額`（1口未満切り捨て）を加算
-- 約定日の基準価額が公表された後の通知から加算します（SBI証券でも約定日の翌日に保有へ反映されます）。約定した日の口数は、その日の前営業日比には含めません。
+- 約定日の基準価額が公表された後の通知から加算します。SBI証券は約定日の翌日に保有へ反映するため、`update.sh` を約定日当日に実行した場合、その日の約定分はSBIの表示に未反映として推定で加算します。
+- 約定した日の口数は、その日の前営業日比には含めません。
+- 投資信託協会のデータが遅れていて約定日の基準価額がまだ無い回は、約定待ちとして扱い、公表後に加算します。
 
 海外の休業日は [holidays](https://pypi.org/project/holidays/) ライブラリの祝日データで判定します。臨時休場などで公式の「お申込み不可日一覧」と違う日があり得るため、SBI証券の注文照会・取引履歴とずれたら `update.sh` で表示値に合わせ直してください。その時点の値が新しい起点になります。
 
@@ -106,9 +108,10 @@ gh run list --workflow=notify.yml
 Discordへ送らず取得結果と通知文だけを見る場合:
 
 ```sh
-python3 -m pip install --user -r requirements.txt   # 初回のみ（update.sh は自動で入れます）
-python3 notifier.py --dry-run
+.venv/bin/python3 notifier.py --dry-run
 ```
+
+`.venv` は `update.sh` の初回実行時に作られ、休業日判定に使う `holidays` が入ります（Homebrew の Python は pip での直接インストールを受け付けないため、専用の仮想環境を使います）。
 
 保有情報は環境変数 `PORTFOLIO_JSON`、なければ `portfolio.json` から読みます。S&P500だけだった頃のSecret（`PORTFOLIO_UNITS` / `PORTFOLIO_ACQUISITION_AMOUNT`）は、`PORTFOLIO_JSON` が無いときだけS&P500の保有として使われます。
 
