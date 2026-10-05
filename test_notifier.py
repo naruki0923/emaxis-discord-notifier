@@ -158,7 +158,7 @@ class EstimatePurchasesTest(unittest.TestCase):
     ]
 
     def test_monthly_and_one_off_orders(self):
-        holding = Holding(0, 0, date(2026, 10, 5), 5_000, 10, ((date(2026, 10, 5), 10_000),))
+        holding = Holding(0, 0, date(2026, 10, 5), 5_000, 10, orders=((date(2026, 10, 5), 10_000),))
         purchases = estimate_purchases(ALLCOUNTRY, holding, self.HISTORY, date(2026, 11, 30))
         self.assertEqual(
             [(p.trade_date, p.amount, p.price, p.units) for p in purchases],
@@ -183,6 +183,17 @@ class EstimatePurchasesTest(unittest.TestCase):
         holding = Holding(0, 0, date(2026, 10, 6), orders=((date(2026, 10, 5), 10_000),))
         purchases = estimate_purchases(ALLCOUNTRY, holding, self.HISTORY, date(2026, 10, 31))
         self.assertEqual([p.trade_date for p in purchases], [date(2026, 10, 6)])
+
+    def test_no_purchases_before_monthly_plan_was_set(self):
+        # 10/14 に「毎月10日」を設定。10/13申込・10/14約定の回は存在しない。
+        holding = Holding(0, 0, date(2026, 10, 14), 5_000, 10, monthly_since=date(2026, 10, 14))
+        purchases = estimate_purchases(ALLCOUNTRY, holding, self.HISTORY, date(2026, 11, 30))
+        self.assertEqual([p.order_date for p in purchases], [date(2026, 11, 10)])
+
+        # 10/5 に設定した場合は 10/13 申込の回から
+        holding = Holding(0, 0, date(2026, 10, 5), 5_000, 10, monthly_since=date(2026, 10, 5))
+        purchases = estimate_purchases(ALLCOUNTRY, holding, self.HISTORY, date(2026, 11, 30))
+        self.assertEqual([p.order_date for p in purchases], [date(2026, 10, 13), date(2026, 11, 10)])
 
     def test_previous_month_order_carried_over_past_as_of(self):
         # 積立日30日: 12/30申込→12/31〜1/3休業→1/4約定。1/2時点の登録でも12月分を数える。
@@ -231,6 +242,10 @@ class HoldingsTest(unittest.TestCase):
             }
         )
         self.assertEqual(holdings["sp500"], Holding(2_402, 12_000, date(2026, 10, 5), 5_000, 10))
+        since = parse_holdings(
+            {"sp500": {"units": 1, "acquisition_amount": 1, "monthly": {"amount": 5_000, "day": 10, "since": "2026-10-05"}}}
+        )["sp500"].monthly_since
+        self.assertEqual(since, date(2026, 10, 5))
         self.assertEqual(
             holdings["allcountry"], Holding(1_322, 5_000, orders=((date(2026, 10, 5), 10_000),))
         )

@@ -140,6 +140,8 @@ class Holding:
     as_of: date | None = None
     monthly_amount: int = 0
     monthly_day: int = 0
+    # 積立を設定した日。SBI証券は設定後に来る申込日から発注するため、この日以前の申込は無い。
+    monthly_since: date | None = None
     # 積立以外の単発の買付（申込日, 金額）。SBI証券の表示に反映される前の分を推定するために使う。
     orders: tuple[tuple[date, int], ...] = ()
 
@@ -362,16 +364,17 @@ def schedule_order(fund: Fund, requested: date, amount: int) -> Purchase:
 
 def scheduled_purchases(fund: Fund, holding: Holding, since: date, until: date) -> list[Purchase]:
     """申込日が until まで、約定日が since 以降の積立・単発の買付を、日付だけ決めて並べる。"""
-    requests = list(holding.orders)
+    purchases = [schedule_order(fund, requested, amount) for requested, amount in holding.orders]
     if holding.monthly_amount > 0:
         # 前月の積立が休業日で繰り越され、since 以降に約定することがあるため前月から見る。
         year, month = (since.year - 1, 12) if since.month == 1 else (since.year, since.month - 1)
         while date(year, month, 1) <= until:
             day = min(holding.monthly_day, calendar.monthrange(year, month)[1])
-            requests.append((date(year, month, day), holding.monthly_amount))
+            purchase = schedule_order(fund, date(year, month, day), holding.monthly_amount)
+            if holding.monthly_since is None or purchase.order_date > holding.monthly_since:
+                purchases.append(purchase)
             year, month = (year + 1, 1) if month == 12 else (year, month + 1)
 
-    purchases = [schedule_order(fund, requested, amount) for requested, amount in requests]
     return sorted(
         (p for p in purchases if p.order_date <= until and p.trade_date >= since),
         key=lambda p: p.trade_date,
@@ -424,6 +427,7 @@ def parse_holding(data: Any) -> Holding:
         monthly = data.get("monthly") or {}
         monthly_amount = int(monthly.get("amount", 0))
         monthly_day = int(monthly.get("day", 0))
+        monthly_since = date.fromisoformat(monthly["since"]) if monthly.get("since") else None
         orders = tuple(
             (date.fromisoformat(order["date"]), int(order["amount"])) for order in data.get("orders") or []
         )
@@ -433,7 +437,7 @@ def parse_holding(data: Any) -> Holding:
         raise NotifierError("保有口数・取得金額・積立金額には0以上、買付金額には1以上の数を指定してください。")
     if monthly_amount > 0 and not 1 <= monthly_day <= 31:
         raise NotifierError("積立日には1〜31を指定してください。")
-    return Holding(units, acquisition_amount, as_of, monthly_amount, monthly_day, orders)
+    return Holding(units, acquisition_amount, as_of, monthly_amount, monthly_day, monthly_since, orders)
 
 
 def parse_holdings(data: Any) -> dict[str, Holding]:

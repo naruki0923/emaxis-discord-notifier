@@ -35,6 +35,8 @@ def holding_to_dict(holding) -> dict:
     }
     if holding.monthly_amount > 0:
         data["monthly"] = {"amount": holding.monthly_amount, "day": holding.monthly_day}
+        if holding.monthly_since:
+            data["monthly"]["since"] = holding.monthly_since.isoformat()
     if holding.orders:
         data["orders"] = [{"date": d.isoformat(), "amount": a} for d, a in holding.orders]
     return data
@@ -100,6 +102,11 @@ def main() -> int:
         }
         if monthly_amount > 0:
             entry["monthly"] = {"amount": monthly_amount, "day": monthly_day}
+            # 積立の内容が変わらなければ設定日を引き継ぎ、新しく設定・変更したら今日を設定日にする。
+            unchanged = (previous_monthly.get("amount"), previous_monthly.get("day")) == (monthly_amount, monthly_day)
+            since = previous_monthly.get("since") if unchanged else today.isoformat()
+            if since:
+                entry["monthly"]["since"] = since
         if orders:
             entry["orders"] = orders
         parse_holding(entry)  # 書き込む前に形式を確かめる
