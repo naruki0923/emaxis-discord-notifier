@@ -81,6 +81,19 @@ class PortfolioUpdateTest(unittest.TestCase):
         self.run_update("sp500", "2", "2", "--monthly", "10,000", today=date(2026, 11, 20))
         self.assertEqual(self.saved()["sp500"]["monthly"], {"amount": 10_000, "day": 10, "since": "2026-10-05"})
 
+    def test_stopping_plan_keeps_order_already_placed(self):
+        # 10/13申込・10/14約定の回は、10/14に積立をやめてもSBIでは約定する
+        self.run_update("オルカン", "0", "0", "--monthly", "5,000", "--day", "10")
+        self.run_update("オルカン", "0", "0", "--monthly", "0", today=date(2026, 10, 14))
+        saved = self.saved()["allcountry"]
+        self.assertNotIn("monthly", saved)
+        self.assertEqual(saved["orders"], [{"date": "2026-10-13", "amount": 5_000}])
+
+    def test_stopping_plan_before_order_keeps_nothing(self):
+        self.run_update("オルカン", "0", "0", "--monthly", "5,000", "--day", "10")
+        self.run_update("オルカン", "0", "0", "--monthly", "0", today=date(2026, 10, 9))
+        self.assertNotIn("orders", self.saved()["allcountry"])
+
     def test_monthly_new_requires_monthly(self):
         code, err = self.run_update("sp500", "1", "1", "--monthly-new")
         self.assertEqual(code, 1)

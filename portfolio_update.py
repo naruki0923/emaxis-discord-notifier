@@ -21,6 +21,7 @@ from notifier import (
     parse_holding,
     parse_holdings,
     resolve_fund_key,
+    scheduled_purchases,
 )
 
 
@@ -110,6 +111,14 @@ def main(argv: list[str] | None = None, today: date | None = None) -> int:
             for order in (current.get(key) or {}).get("orders") or []
             if not args.clear_buys and order["date"] >= (today - timedelta(days=14)).isoformat()
         ]
+        if monthly_amount == 0 and previous_monthly.get("amount", 0) > 0:
+            # 積立をやめても、それまでに申込済みでSBIの表示に未反映の回は約定するため単発の買付として残す。
+            fund = next(f for f in FUNDS if f.key == key)
+            previous = parse_holding({**current[key], "as_of": today.isoformat(), "orders": []})
+            for purchase in scheduled_purchases(fund, previous, today, today):
+                order = {"date": purchase.order_date.isoformat(), "amount": purchase.amount}
+                if order not in orders:
+                    orders.append(order)
         if args.buy is not None:
             try:
                 buy_date = date.fromisoformat(args.buy_date) if args.buy_date else today
