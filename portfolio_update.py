@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from notifier import (
     FUND_ALIASES,
@@ -35,6 +35,8 @@ def holding_to_dict(holding) -> dict:
     }
     if holding.monthly_amount > 0:
         data["monthly"] = {"amount": holding.monthly_amount, "day": holding.monthly_day}
+    if holding.orders:
+        data["orders"] = [{"date": d.isoformat(), "amount": a} for d, a in holding.orders]
     return data
 
 
@@ -46,6 +48,7 @@ def main() -> int:
     parser.add_argument("values", nargs="+", metavar="[銘柄] 保有口数 取得金額")
     parser.add_argument("--monthly", help="毎月の積立金額（円）。0で積立なし")
     parser.add_argument("--day", help="毎月の積立日（1〜31）")
+    parser.add_argument("--buy", help="今日注文した単発の買付金額（円）。SBI証券の表示に反映されるまで推定で加算する")
     args = parser.parse_args()
 
     try:
@@ -69,13 +72,26 @@ def main() -> int:
         )
         monthly_day = parse_number(args.day) if args.day is not None else previous_monthly.get("day", 0)
 
+        today = datetime.now(JST).date()
+        # 前回までの単発の買付は、約定がSBI証券の表示に入ったかを as_of で判定するため残しておく。
+        # 約定から十分たったものは表示に入っているはずなので消す。
+        orders = [
+            order
+            for order in (current.get(key) or {}).get("orders") or []
+            if order["date"] >= (today - timedelta(days=14)).isoformat()
+        ]
+        if args.buy is not None:
+            orders.append({"date": today.isoformat(), "amount": parse_number(args.buy)})
+
         entry = {
             "units": parse_number(units_raw),
             "acquisition_amount": parse_number(amount_raw),
-            "as_of": datetime.now(JST).date().isoformat(),
+            "as_of": today.isoformat(),
         }
         if monthly_amount > 0:
             entry["monthly"] = {"amount": monthly_amount, "day": monthly_day}
+        if orders:
+            entry["orders"] = orders
         parse_holding(entry)  # 書き込む前に形式を確かめる
         current[key] = entry
     except NotifierError as exc:
@@ -96,6 +112,8 @@ def main() -> int:
         f"{fund.name}: {entry['units']:,}口 / 取得金額 {entry['acquisition_amount']:,}円"
         f"（{entry['as_of']}時点）/ 積立: {plan}"
     )
+    for order in entry.get("orders", []):
+        print(f"  単発の買付: {order['date']} 注文 {order['amount']:,}円（約定がこの時点より後なら推定で加算）")
     return 0
 
 

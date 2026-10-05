@@ -130,6 +130,8 @@ class Holding:
     as_of: date | None = None
     monthly_amount: int = 0
     monthly_day: int = 0
+    # 積立以外の単発の買付（注文日, 金額）。SBI証券の表示に反映される前の分を推定するために使う。
+    orders: tuple[tuple[date, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -145,6 +147,15 @@ class FundReport:
     price: FundPrice
     portfolio: Portfolio | None = None
     purchases: tuple[Purchase, ...] = field(default_factory=tuple)
+
+    def daily_change(self) -> int:
+        """保有分の前営業日比。基準日に約定した口数は前営業日に持っていないので除く。"""
+        if self.portfolio is None:
+            return 0
+        price_date = parse_japanese_date(self.price.date)
+        new_units = sum(p.units for p in self.purchases if p.date >= price_date)
+        held = Portfolio(self.portfolio.units - new_units, self.portfolio.acquisition_amount)
+        return held.daily_change(self.price)
 
 
 def request_bytes(
@@ -272,31 +283,33 @@ def fetch_fund_price_from_mufg(fund: Fund) -> FundPrice:
 
 
 def estimate_purchases(holding: Holding, history: list[tuple[date, int]]) -> list[Purchase]:
-    """as_of より後に約定した積立を、公開されている基準価額から推定する。
+    """as_of より後に約定した積立・単発の買付を、公開されている基準価額から推定する。
 
-    積立日（休日なら翌営業日）に注文し、その翌営業日の基準価額で約定する前提。
+    注文日（休日なら翌営業日）の翌営業日の基準価額で約定する前提。
     営業日は基準価額が公表された日で判定する。約定日の基準価額がまだ無い回は数えない。
     """
-    if holding.as_of is None or holding.monthly_amount <= 0 or not history:
+    if holding.as_of is None or not history:
         return []
 
     history = sorted(history)
     dates = [d for d, _ in history]
+    orders = list(holding.orders)
+    if holding.monthly_amount > 0:
+        year, month = holding.as_of.year, holding.as_of.month
+        while (year, month) <= (dates[-1].year, dates[-1].month):
+            day = min(holding.monthly_day, calendar.monthrange(year, month)[1])
+            orders.append((date(year, month, day), holding.monthly_amount))
+            year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+
     purchases: list[Purchase] = []
-    year, month = holding.as_of.year, holding.as_of.month
-    last = dates[-1]
-    while (year, month) <= (last.year, last.month):
-        day = min(holding.monthly_day, calendar.monthrange(year, month)[1])
-        target = date(year, month, day)
-        order_index = next((i for i, d in enumerate(dates) if d >= target), None)
+    for order_date, amount in orders:
+        order_index = next((i for i, d in enumerate(dates) if d >= order_date), None)
         if order_index is None or order_index + 1 >= len(dates):
-            break
+            continue
         trade_date, price = history[order_index + 1]
         if trade_date > holding.as_of:
-            units = holding.monthly_amount * 10_000 // price
-            purchases.append(Purchase(date=trade_date, amount=holding.monthly_amount, units=units))
-        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
-    return purchases
+            purchases.append(Purchase(date=trade_date, amount=amount, units=amount * 10_000 // price))
+    return sorted(purchases, key=lambda p: p.date)
 
 
 def resolve_fund_key(name: str) -> str:
@@ -316,13 +329,16 @@ def parse_holding(data: Any) -> Holding:
         monthly = data.get("monthly") or {}
         monthly_amount = int(monthly.get("amount", 0))
         monthly_day = int(monthly.get("day", 0))
+        orders = tuple(
+            (date.fromisoformat(order["date"]), int(order["amount"])) for order in data.get("orders") or []
+        )
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         raise NotifierError("保有情報の形式が正しくありません。") from exc
-    if units < 0 or acquisition_amount < 0 or monthly_amount < 0:
-        raise NotifierError("保有口数・取得金額・積立金額には0以上の数を指定してください。")
+    if units < 0 or acquisition_amount < 0 or monthly_amount < 0 or any(a <= 0 for _, a in orders):
+        raise NotifierError("保有口数・取得金額・積立金額には0以上、買付金額には1以上の数を指定してください。")
     if monthly_amount > 0 and not 1 <= monthly_day <= 31:
         raise NotifierError("積立日には1〜31を指定してください。")
-    return Holding(units, acquisition_amount, as_of, monthly_amount, monthly_day)
+    return Holding(units, acquisition_amount, as_of, monthly_amount, monthly_day, orders)
 
 
 def parse_holdings(data: Any) -> dict[str, Holding]:
@@ -369,7 +385,7 @@ def build_report(fund: Fund, holding: Holding | None) -> FundReport:
         return FundReport(fund, price)
 
     purchases: list[Purchase] = []
-    if holding.monthly_amount > 0 and holding.as_of is not None:
+    if (holding.monthly_amount > 0 or holding.orders) and holding.as_of is not None:
         purchases = estimate_purchases(holding, fetch_price_history(fund))
     portfolio = Portfolio(
         units=holding.units + sum(p.units for p in purchases),
@@ -427,7 +443,7 @@ def build_message(reports: list[FundReport], errors: list[tuple[Fund, str]] | No
             changes.append(f"{fund.label}：取得できませんでした")
         elif report is not None and report.portfolio is not None:
             assets.append(f"{fund.label}：{report.portfolio.valuation(report.price):,}円")
-            changes.append(f"{fund.label}：{signed(report.portfolio.daily_change(report.price))}円")
+            changes.append(f"{fund.label}：{signed(report.daily_change())}円")
         else:
             assets.append(f"{fund.label}：保有情報が未設定です")
             changes.append(f"{fund.label}：保有情報が未設定です")
@@ -440,7 +456,7 @@ def build_message(reports: list[FundReport], errors: list[tuple[Fund, str]] | No
             "・前営業日比",
             *changes,
             "",
-            "・",
+            "・損益",
             f"投資金額：{invested:,}円",
             f"資産：{total:,}円",
         ]
@@ -475,7 +491,7 @@ def print_details(reports: list[FundReport], errors: list[tuple[Fund, str]]) -> 
                 f" / 評価損益 {signed(portfolio.profit(price))}円"
             )
         for purchase in report.purchases:
-            print(f"  積立（推定）: {purchase.date} 約定 {purchase.amount:,}円 → {purchase.units:,}口")
+            print(f"  買付（推定）: {purchase.date} 約定 {purchase.amount:,}円 → {purchase.units:,}口")
     for fund, message in errors:
         print(f"[{fund.name}] エラー: {message}")
     print()

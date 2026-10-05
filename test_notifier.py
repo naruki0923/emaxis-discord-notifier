@@ -72,7 +72,7 @@ class MessageTest(unittest.TestCase):
             "S＆P500：+35円\n"
             "オルカン：-7円\n"
             "\n"
-            "・\n"
+            "・損益\n"
             "投資金額：17,000円\n"
             "資産：15,728円",
         )
@@ -123,6 +123,19 @@ class EstimatePurchasesTest(unittest.TestCase):
         purchases = estimate_purchases(self.holding(date(2026, 10, 5)), self.HISTORY[:3])
         self.assertEqual(purchases, [])
 
+    def test_one_off_order_is_added_after_trade(self):
+        holding = Holding(units=0, acquisition_amount=0, as_of=date(2026, 10, 9), orders=((date(2026, 10, 9), 10_000),))
+        purchases = estimate_purchases(holding, self.HISTORY[:3])
+        self.assertEqual(purchases, [notifier.Purchase(date(2026, 10, 13), 10_000, 10_000 * 10_000 // 37_200)])
+        self.assertEqual(estimate_purchases(holding, self.HISTORY[:2]), [])
+
+    def test_one_off_order_and_monthly_plan_together(self):
+        holding = Holding(0, 0, date(2026, 10, 5), 5_000, 10, ((date(2026, 10, 5), 10_000),))
+        purchases = estimate_purchases(holding, [(date(2026, 10, 5), 37_000), (date(2026, 10, 6), 37_500)] + self.HISTORY)
+        self.assertEqual([(p.date, p.amount) for p in purchases], [
+            (date(2026, 10, 6), 10_000), (date(2026, 10, 14), 5_000), (date(2026, 11, 11), 5_000),
+        ])
+
     def test_no_estimate_without_monthly_plan(self):
         holding = Holding(units=1_000, acquisition_amount=5_000, as_of=date(2026, 10, 5))
         self.assertEqual(estimate_purchases(holding, self.HISTORY), [])
@@ -138,11 +151,14 @@ class HoldingsTest(unittest.TestCase):
             {
                 "sp500": {"units": 2_402, "acquisition_amount": 12_000, "as_of": "2026-10-05",
                           "monthly": {"amount": 5_000, "day": 10}},
-                "オルカン": {"units": 1_322, "acquisition_amount": 5_000},
+                "オルカン": {"units": 1_322, "acquisition_amount": 5_000,
+                          "orders": [{"date": "2026-10-05", "amount": 10_000}]},
             }
         )
         self.assertEqual(holdings["sp500"], Holding(2_402, 12_000, date(2026, 10, 5), 5_000, 10))
-        self.assertEqual(holdings["allcountry"], Holding(1_322, 5_000))
+        self.assertEqual(
+            holdings["allcountry"], Holding(1_322, 5_000, orders=((date(2026, 10, 5), 10_000),))
+        )
 
     def test_rejects_monthly_without_day(self):
         with self.assertRaises(NotifierError):
@@ -172,6 +188,17 @@ class BuildReportTest(unittest.TestCase):
         ):
             report = notifier.build_report(ALLCOUNTRY, holding)
         self.assertEqual(report.portfolio, Portfolio(1_000 + 5_000 * 10_000 // 37_300, 10_000))
+
+
+class DailyChangeTest(unittest.TestCase):
+    def test_units_bought_on_price_date_have_no_daily_change(self):
+        report = FundReport(
+            ALLCOUNTRY,
+            FundPrice(date="2026年10月06日", price=38_000, change=100),
+            Portfolio(units=3_631, acquisition_amount=14_000),
+            (notifier.Purchase(date(2026, 10, 6), 10_000, 2_631),),
+        )
+        self.assertEqual(report.daily_change(), 10)
 
 
 class ToushinCsvTest(unittest.TestCase):
