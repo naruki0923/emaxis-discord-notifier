@@ -110,7 +110,9 @@ def main(argv: list[str] | None = None, today: date | None = None) -> int:
                 raise NotifierError("--buy-date は YYYY-MM-DD の形で指定してください。") from exc
             order = {"date": buy_date.isoformat(), "amount": parse_number(args.buy)}
             # 打ち直しで同じ買付が二重に入らないよう、同じ申込日・金額のものは1件にする。
-            if order not in orders:
+            if order in orders:
+                print(f"同じ買付（{order['date']} 申込 {order['amount']:,}円）は登録済みのため追加しません。")
+            else:
                 orders.append(order)
         elif args.buy_date:
             raise NotifierError("--buy-date は --buy と一緒に指定してください。")
