@@ -70,12 +70,21 @@ class PortfolioUpdateTest(unittest.TestCase):
         self.run_update("オルカン", "0", "0", "--clear-buys")
         self.assertNotIn("orders", self.saved()["allcountry"])
 
-    def test_monthly_since_is_kept_until_plan_changes(self):
+    def test_existing_plan_has_no_since(self):
         self.run_update("sp500", "1", "1", "--monthly", "5,000", "--day", "10")
+        self.assertEqual(self.saved()["sp500"]["monthly"], {"amount": 5_000, "day": 10})
+
+    def test_monthly_new_sets_since_and_it_is_kept(self):
+        self.run_update("sp500", "1", "1", "--monthly", "5,000", "--day", "10", "--monthly-new")
         self.run_update("sp500", "2", "2", today=date(2026, 11, 20))
         self.assertEqual(self.saved()["sp500"]["monthly"], {"amount": 5_000, "day": 10, "since": "2026-10-05"})
         self.run_update("sp500", "2", "2", "--monthly", "10,000", today=date(2026, 11, 20))
-        self.assertEqual(self.saved()["sp500"]["monthly"], {"amount": 10_000, "day": 10, "since": "2026-11-20"})
+        self.assertEqual(self.saved()["sp500"]["monthly"], {"amount": 10_000, "day": 10, "since": "2026-10-05"})
+
+    def test_monthly_new_requires_monthly(self):
+        code, err = self.run_update("sp500", "1", "1", "--monthly-new")
+        self.assertEqual(code, 1)
+        self.assertIn("--monthly と一緒に", err)
 
     def test_bad_input_leaves_existing_file(self):
         self.run_update("sp500", "2,202", "10,000")
