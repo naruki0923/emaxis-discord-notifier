@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""eMAXIS Slim 米国株式（S&P500）の基準価額をDiscordへ通知する。"""
+"""保有中の eMAXIS Slim の評価額と前営業日比をDiscordへ通知する。"""
 
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import os
 import subprocess
@@ -11,27 +12,67 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
 
-FUND_CODE = "253266"
-FUND_NAME = "eMAXIS Slim 米国株式（S&P500）"
-FUND_URL = f"https://emaxis.am.mufg.jp/fund/{FUND_CODE}.html"
-API_URL = f"https://www.am.mufg.jp/mukamapi/fund_details/?fund_cd={FUND_CODE}"
-# 三菱UFJ側は国外・データセンターのIPを拒否するため、投資信託協会の公開データを代替に使う。
-TOUSHIN_ISIN = "JP90C000H1T1"
-TOUSHIN_FUND_CODE = "03311187"
-TOUSHIN_CSV_URL = (
-    "https://toushin-lib.fwg.ne.jp/FdsWeb/FDST030000/csv-file-download"
-    f"?isinCd={TOUSHIN_ISIN}&associFundCd={TOUSHIN_FUND_CODE}"
-)
+JST = timezone(timedelta(hours=9))
 KEYCHAIN_SERVICE = "emaxis-discord-notifier"
 KEYCHAIN_ACCOUNT = "discord-webhook-url"
 USER_AGENT = "emaxis-discord-notifier/1.0"
 PORTFOLIO_PATH = Path(__file__).with_name("portfolio.json")
+
+
+@dataclass(frozen=True)
+class Fund:
+    key: str
+    label: str
+    name: str
+    mufg_code: str
+    isin: str
+    association_code: str
+
+    @property
+    def api_url(self) -> str:
+        return f"https://www.am.mufg.jp/mukamapi/fund_details/?fund_cd={self.mufg_code}"
+
+    # 三菱UFJ側は国外・データセンターのIPを拒否するため、投資信託協会の公開データを代替に使う。
+    @property
+    def toushin_csv_url(self) -> str:
+        return (
+            "https://toushin-lib.fwg.ne.jp/FdsWeb/FDST030000/csv-file-download"
+            f"?isinCd={self.isin}&associFundCd={self.association_code}"
+        )
+
+
+FUNDS = (
+    Fund(
+        key="sp500",
+        label="S＆P500",
+        name="eMAXIS Slim 米国株式（S&P500）",
+        mufg_code="253266",
+        isin="JP90C000GKC6",
+        association_code="03311187",
+    ),
+    Fund(
+        key="allcountry",
+        label="オルカン",
+        name="eMAXIS Slim 全世界株式（オール・カントリー）",
+        mufg_code="253425",
+        isin="JP90C000H1T1",
+        association_code="0331418A",
+    ),
+)
+FUND_ALIASES = {
+    "sp500": "sp500",
+    "s&p500": "sp500",
+    "allcountry": "allcountry",
+    "orukan": "allcountry",
+    "オルカン": "allcountry",
+}
 
 
 class NotifierError(RuntimeError):
@@ -80,6 +121,32 @@ class Portfolio:
         return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
+@dataclass(frozen=True)
+class Holding:
+    """update.sh で登録した保有内容と、毎月の積立設定。"""
+
+    units: int
+    acquisition_amount: int
+    as_of: date | None = None
+    monthly_amount: int = 0
+    monthly_day: int = 0
+
+
+@dataclass(frozen=True)
+class Purchase:
+    date: date
+    amount: int
+    units: int
+
+
+@dataclass(frozen=True)
+class FundReport:
+    fund: Fund
+    price: FundPrice
+    portfolio: Portfolio | None = None
+    purchases: tuple[Purchase, ...] = field(default_factory=tuple)
+
+
 def request_bytes(
     url: str,
     *,
@@ -122,7 +189,14 @@ def request_json(url: str, *, method: str = "GET", payload: dict[str, Any] | Non
         raise NotifierError(f"応答をJSONとして解釈できませんでした: {exc}") from exc
 
 
-def parse_toushin_csv(text: str) -> FundPrice:
+def parse_japanese_date(text: str) -> date:
+    try:
+        return datetime.strptime(text, "%Y年%m月%d日").date()
+    except ValueError as exc:
+        raise NotifierError(f"日付を解釈できませんでした: {text}") from exc
+
+
+def parse_toushin_history(text: str) -> list[tuple[str, int]]:
     rows: list[tuple[str, int]] = []
     for line in text.splitlines()[1:]:
         columns = line.split(",")
@@ -133,43 +207,50 @@ def parse_toushin_csv(text: str) -> FundPrice:
         if not date_raw or not price_raw.isdigit():
             continue
         rows.append((date_raw, int(price_raw)))
+    return rows
 
+
+def parse_toushin_csv(text: str) -> FundPrice:
+    rows = parse_toushin_history(text)
     if len(rows) < 2:
         raise NotifierError("投資信託協会のデータに基準価額が2営業日分ありません。")
 
-    date, price = rows[-1]
+    date_str, price = rows[-1]
     _, previous_price = rows[-2]
     return FundPrice(
-        date=date,
+        date=date_str,
         price=price,
         change=price - previous_price,
         source="投資信託協会 投信総合検索ライブラリー",
     )
 
 
-def fetch_fund_price_from_toushin() -> FundPrice:
-    body = request_bytes(TOUSHIN_CSV_URL, accept="text/csv,*/*")
+def fetch_toushin_text(fund: Fund) -> str:
+    body = request_bytes(fund.toushin_csv_url, accept="text/csv,*/*")
     try:
-        text = body.decode("cp932")
+        return body.decode("cp932")
     except UnicodeDecodeError as exc:
         raise NotifierError("投資信託協会のCSVを解読できませんでした。") from exc
-    return parse_toushin_csv(text)
 
 
-def fetch_fund_price() -> FundPrice:
+def fetch_price_history(fund: Fund) -> list[tuple[date, int]]:
+    return [(parse_japanese_date(d), p) for d, p in parse_toushin_history(fetch_toushin_text(fund))]
+
+
+def fetch_fund_price(fund: Fund) -> FundPrice:
     try:
-        return fetch_fund_price_from_mufg()
+        return fetch_fund_price_from_mufg(fund)
     except NotifierError as mufg_error:
         try:
-            return fetch_fund_price_from_toushin()
+            return parse_toushin_csv(fetch_toushin_text(fund))
         except NotifierError as toushin_error:
             raise NotifierError(
                 f"基準価額を取得できませんでした（公式サイト: {mufg_error} / 投資信託協会: {toushin_error}）"
             ) from toushin_error
 
 
-def fetch_fund_price_from_mufg() -> FundPrice:
-    response = request_json(API_URL)
+def fetch_fund_price_from_mufg(fund: Fund) -> FundPrice:
+    response = request_json(fund.api_url)
     if not isinstance(response, dict) or response.get("result", {}).get("status") != 200:
         raise NotifierError("公式APIから正常な応答を取得できませんでした。")
 
@@ -186,11 +267,81 @@ def fetch_fund_price_from_mufg() -> FundPrice:
 
     if len(date_raw) != 8 or not date_raw.isdigit():
         raise NotifierError("公式APIの基準日が想定と異なります。")
-    date = f"{date_raw[:4]}年{date_raw[4:6]}月{date_raw[6:]}日"
-    return FundPrice(date=date, price=price, change=change)
+    date_str = f"{date_raw[:4]}年{date_raw[4:6]}月{date_raw[6:]}日"
+    return FundPrice(date=date_str, price=price, change=change)
 
 
-def load_portfolio() -> Portfolio | None:
+def estimate_purchases(holding: Holding, history: list[tuple[date, int]]) -> list[Purchase]:
+    """as_of より後に約定した積立を、公開されている基準価額から推定する。
+
+    積立日（休日なら翌営業日）に注文し、その翌営業日の基準価額で約定する前提。
+    営業日は基準価額が公表された日で判定する。約定日の基準価額がまだ無い回は数えない。
+    """
+    if holding.as_of is None or holding.monthly_amount <= 0 or not history:
+        return []
+
+    history = sorted(history)
+    dates = [d for d, _ in history]
+    purchases: list[Purchase] = []
+    year, month = holding.as_of.year, holding.as_of.month
+    last = dates[-1]
+    while (year, month) <= (last.year, last.month):
+        day = min(holding.monthly_day, calendar.monthrange(year, month)[1])
+        target = date(year, month, day)
+        order_index = next((i for i, d in enumerate(dates) if d >= target), None)
+        if order_index is None or order_index + 1 >= len(dates):
+            break
+        trade_date, price = history[order_index + 1]
+        if trade_date > holding.as_of:
+            units = holding.monthly_amount * 10_000 // price
+            purchases.append(Purchase(date=trade_date, amount=holding.monthly_amount, units=units))
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    return purchases
+
+
+def resolve_fund_key(name: str) -> str:
+    key = FUND_ALIASES.get(name.strip().lower())
+    if key is None:
+        choices = " / ".join(FUND_ALIASES)
+        raise NotifierError(f"銘柄「{name}」は対象外です。次のいずれかを指定してください: {choices}")
+    return key
+
+
+def parse_holding(data: Any) -> Holding:
+    try:
+        units = int(data["units"])
+        acquisition_amount = int(data["acquisition_amount"])
+        as_of_raw = data.get("as_of")
+        as_of = date.fromisoformat(as_of_raw) if as_of_raw else None
+        monthly = data.get("monthly") or {}
+        monthly_amount = int(monthly.get("amount", 0))
+        monthly_day = int(monthly.get("day", 0))
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise NotifierError("保有情報の形式が正しくありません。") from exc
+    if units < 0 or acquisition_amount < 0 or monthly_amount < 0:
+        raise NotifierError("保有口数・取得金額・積立金額には0以上の数を指定してください。")
+    if monthly_amount > 0 and not 1 <= monthly_day <= 31:
+        raise NotifierError("積立日には1〜31を指定してください。")
+    return Holding(units, acquisition_amount, as_of, monthly_amount, monthly_day)
+
+
+def parse_holdings(data: Any) -> dict[str, Holding]:
+    if not isinstance(data, dict):
+        raise NotifierError("保有情報の形式が正しくありません。")
+    # 1銘柄だけだった頃の形式（units と acquisition_amount だけ）は S&P500 として読む。
+    if "units" in data:
+        return {"sp500": parse_holding(data)}
+    return {resolve_fund_key(key): parse_holding(value) for key, value in data.items()}
+
+
+def load_holdings() -> dict[str, Holding]:
+    env_json = os.environ.get("PORTFOLIO_JSON", "").strip()
+    if env_json:
+        try:
+            return parse_holdings(json.loads(env_json))
+        except json.JSONDecodeError as exc:
+            raise NotifierError("PORTFOLIO_JSONをJSONとして解釈できませんでした。") from exc
+
     env_units = os.environ.get("PORTFOLIO_UNITS", "").strip()
     env_amount = os.environ.get("PORTFOLIO_ACQUISITION_AMOUNT", "").strip()
     if env_units or env_amount:
@@ -201,21 +352,30 @@ def load_portfolio() -> Portfolio | None:
             raise NotifierError(
                 "PORTFOLIO_UNITSとPORTFOLIO_ACQUISITION_AMOUNTには整数を指定してください。"
             ) from exc
-        if units < 0 or acquisition_amount < 0:
-            raise NotifierError("保有口数と取得金額には0以上の数を指定してください。")
-        return Portfolio(units=units, acquisition_amount=acquisition_amount)
+        return parse_holdings({"units": units, "acquisition_amount": acquisition_amount})
 
     if not PORTFOLIO_PATH.exists():
-        return None
+        return {}
     try:
         data = json.loads(PORTFOLIO_PATH.read_text(encoding="utf-8"))
-        units = int(data["units"])
-        acquisition_amount = int(data["acquisition_amount"])
-    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+    except (OSError, json.JSONDecodeError) as exc:
         raise NotifierError("portfolio.jsonの形式が正しくありません。") from exc
-    if units < 0 or acquisition_amount < 0:
-        raise NotifierError("保有口数と取得金額には0以上の数を指定してください。")
-    return Portfolio(units=units, acquisition_amount=acquisition_amount)
+    return parse_holdings(data)
+
+
+def build_report(fund: Fund, holding: Holding | None) -> FundReport:
+    price = fetch_fund_price(fund)
+    if holding is None:
+        return FundReport(fund, price)
+
+    purchases: list[Purchase] = []
+    if holding.monthly_amount > 0 and holding.as_of is not None:
+        purchases = estimate_purchases(holding, fetch_price_history(fund))
+    portfolio = Portfolio(
+        units=holding.units + sum(p.units for p in purchases),
+        acquisition_amount=holding.acquisition_amount + sum(p.amount for p in purchases),
+    )
+    return FundReport(fund, price, portfolio, tuple(purchases))
 
 
 def get_webhook_url() -> str:
@@ -246,101 +406,79 @@ def get_webhook_url() -> str:
     return result.stdout.strip()
 
 
-def direction(price: FundPrice) -> tuple[str, str, int]:
-    if price.change > 0:
-        return "📈 値上がり", "+", 0x2ECC71
-    if price.change < 0:
-        return "📉 値下がり", "", 0xE74C3C
-    return "➡️ 変わらず", "", 0x95A5A6
-
-
 def signed(value: int) -> str:
     return f"+{value:,}" if value > 0 else f"{value:,}"
 
 
-def signed_decimal(value: Decimal) -> str:
-    return f"+{value}" if value > 0 else f"{value}"
+def build_message(reports: list[FundReport], errors: list[tuple[Fund, str]] | None = None) -> str:
+    errors = errors or []
+    failed = {fund.key for fund, _ in errors}
+    by_key = {report.fund.key: report for report in reports}
+    held = [r for r in reports if r.portfolio is not None]
+    total = sum(r.portfolio.valuation(r.price) for r in held)
+    invested = sum(r.portfolio.acquisition_amount for r in held)
+
+    assets = [f"全体資産：{total:,}円"]
+    changes: list[str] = []
+    for fund in FUNDS:
+        report = by_key.get(fund.key)
+        if fund.key in failed:
+            assets.append(f"{fund.label}：取得できませんでした")
+            changes.append(f"{fund.label}：取得できませんでした")
+        elif report is not None and report.portfolio is not None:
+            assets.append(f"{fund.label}：{report.portfolio.valuation(report.price):,}円")
+            changes.append(f"{fund.label}：{signed(report.portfolio.daily_change(report.price))}円")
+        else:
+            assets.append(f"{fund.label}：保有情報が未設定です")
+            changes.append(f"{fund.label}：保有情報が未設定です")
+
+    return "\n".join(
+        [
+            "・資産",
+            *assets,
+            "",
+            "・前営業日比",
+            *changes,
+            "",
+            "・",
+            f"投資金額：{invested:,}円",
+            f"資産：{total:,}円",
+        ]
+    )
 
 
-def build_discord_payload(price: FundPrice, portfolio: Portfolio | None = None) -> dict[str, Any]:
-    label, sign, color = direction(price)
-    percent = price.change_percent
-    percent_sign = "+" if percent > 0 else ""
-    fields: list[dict[str, Any]] = [
-        {
-            "name": "基準価額（1万口あたり）",
-            "value": f"**{price.price:,}円**",
-            "inline": True,
-        },
-        {
-            "name": "前営業日比",
-            "value": f"**{sign}{price.change:,}円（{percent_sign}{percent}%）**",
-            "inline": True,
-        },
-    ]
-    if portfolio is not None:
-        valuation = portfolio.valuation(price)
-        profit = portfolio.profit(price)
-        profit_percent = portfolio.profit_percent(price)
-        fields.extend(
-            [
-                {
-                    "name": f"あなたの評価額（{portfolio.units:,}口）",
-                    "value": f"**{valuation:,}円**",
-                    "inline": True,
-                },
-                {
-                    "name": "あなたの前日増減",
-                    "value": f"**{signed(portfolio.daily_change(price))}円**",
-                    "inline": True,
-                },
-                {
-                    "name": "購入後の評価損益",
-                    "value": f"**{signed(profit)}円（{signed_decimal(profit_percent)}%）**",
-                    "inline": False,
-                },
-            ]
-        )
-    fields.append({"name": "基準日", "value": price.date, "inline": False})
-    return {
-        "username": "投資信託 基準価額通知",
-        "allowed_mentions": {"parse": []},
-        "embeds": [
-            {
-                "title": FUND_NAME,
-                "url": FUND_URL,
-                "description": label,
-                "color": color,
-                "fields": fields,
-                "footer": {
-                    "text": f"出所: {price.source}（過去の実績であり、将来の成果を保証しません）"
-                },
-            }
-        ],
-    }
-
-
-def send_to_discord(webhook_url: str, payload: dict[str, Any]) -> None:
+def send_to_discord(webhook_url: str, content: str) -> None:
     if not webhook_url.startswith(("https://discord.com/api/webhooks/", "https://discordapp.com/api/webhooks/")):
         raise NotifierError("Discord Webhook URLの形式が正しくありません。")
-    request_json(webhook_url, method="POST", payload=payload)
+    request_json(
+        webhook_url,
+        method="POST",
+        payload={
+            "username": "投資信託 基準価額通知",
+            "allowed_mentions": {"parse": []},
+            "content": content,
+        },
+    )
 
 
-def print_preview(price: FundPrice, portfolio: Portfolio | None = None) -> None:
-    label, sign, _ = direction(price)
-    percent = price.change_percent
-    percent_sign = "+" if percent > 0 else ""
-    print(FUND_NAME)
-    print(f"{label} / {price.date}")
-    print(f"基準価額: {price.price:,}円")
-    print(f"前営業日比: {sign}{price.change:,}円（{percent_sign}{percent}%）")
-    if portfolio is not None:
-        print(f"あなたの評価額: {portfolio.valuation(price):,}円（{portfolio.units:,}口）")
-        print(f"あなたの前日増減: {signed(portfolio.daily_change(price))}円")
-        print(
-            "購入後の評価損益: "
-            f"{signed(portfolio.profit(price))}円（{signed_decimal(portfolio.profit_percent(price))}%）"
-        )
+def print_details(reports: list[FundReport], errors: list[tuple[Fund, str]]) -> None:
+    """--dry-run のときだけ、通知文の根拠を表示する。"""
+    for report in reports:
+        price = report.price
+        print(f"[{report.fund.name}]")
+        print(f"  基準日 {price.date} / 基準価額 {price.price:,}円 / 前営業日比 {signed(price.change)}円")
+        print(f"  取得先: {price.source}")
+        if report.portfolio is not None:
+            portfolio = report.portfolio
+            print(
+                f"  保有 {portfolio.units:,}口 / 取得金額 {portfolio.acquisition_amount:,}円"
+                f" / 評価損益 {signed(portfolio.profit(price))}円"
+            )
+        for purchase in report.purchases:
+            print(f"  積立（推定）: {purchase.date} 約定 {purchase.amount:,}円 → {purchase.units:,}口")
+    for fund, message in errors:
+        print(f"[{fund.name}] エラー: {message}")
+    print()
 
 
 def main() -> int:
@@ -349,14 +487,28 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        price = fetch_fund_price()
-        portfolio = load_portfolio()
+        holdings = load_holdings()
+        reports: list[FundReport] = []
+        errors: list[tuple[Fund, str]] = []
+        for fund in FUNDS:
+            try:
+                reports.append(build_report(fund, holdings.get(fund.key)))
+            except NotifierError as exc:
+                errors.append((fund, str(exc)))
+        for fund, message in errors:
+            print(f"エラー: {fund.name}: {message}", file=sys.stderr)
+        if not reports:
+            return 1
+
+        message = build_message(reports, errors)
         if args.dry_run:
-            print_preview(price, portfolio)
-            return 0
-        send_to_discord(get_webhook_url(), build_discord_payload(price, portfolio))
-        print(f"Discordへ通知しました: {price.date} / {price.price:,}円")
-        return 0
+            print_details(reports, errors)
+            print(message)
+        else:
+            send_to_discord(get_webhook_url(), message)
+            print("Discordへ通知しました:")
+            print(message)
+        return 1 if errors else 0
     except NotifierError as exc:
         print(f"エラー: {exc}", file=sys.stderr)
         return 1

@@ -24,6 +24,8 @@ jobs:
       - name: 基準価額を取得してDiscordへ通知
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PORTFOLIO_JSON: ${{ secrets.PORTFOLIO_JSON }}
+          # PORTFOLIO_JSON がまだ無いときだけ使われる、S&P500のみだった頃の設定。
           PORTFOLIO_UNITS: ${{ secrets.PORTFOLIO_UNITS }}
           PORTFOLIO_ACQUISITION_AMOUNT: ${{ secrets.PORTFOLIO_ACQUISITION_AMOUNT }}
         run: python3 notifier.py
