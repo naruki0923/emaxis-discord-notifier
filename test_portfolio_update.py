@@ -70,34 +70,15 @@ class PortfolioUpdateTest(unittest.TestCase):
         self.run_update("オルカン", "0", "0", "--clear-buys")
         self.assertNotIn("orders", self.saved()["allcountry"])
 
-    def test_existing_plan_has_no_since(self):
+    def test_monthly_since_is_kept_until_plan_changes(self):
+        # 初回登録は前からある積立として扱い、設定日を付けない
         self.run_update("sp500", "1", "1", "--monthly", "5,000", "--day", "10")
         self.assertEqual(self.saved()["sp500"]["monthly"], {"amount": 5_000, "day": 10})
-
-    def test_monthly_new_sets_since_and_it_is_kept(self):
-        self.run_update("sp500", "1", "1", "--monthly", "5,000", "--day", "10", "--monthly-new")
-        self.run_update("sp500", "2", "2", today=date(2026, 11, 20))
-        self.assertEqual(self.saved()["sp500"]["monthly"], {"amount": 5_000, "day": 10, "since": "2026-10-05"})
         self.run_update("sp500", "2", "2", "--monthly", "10,000", today=date(2026, 11, 20))
-        self.assertEqual(self.saved()["sp500"]["monthly"], {"amount": 10_000, "day": 10, "since": "2026-10-05"})
-
-    def test_stopping_plan_keeps_order_already_placed(self):
-        # 10/13申込・10/14約定の回は、10/14に積立をやめてもSBIでは約定する
-        self.run_update("オルカン", "0", "0", "--monthly", "5,000", "--day", "10")
-        self.run_update("オルカン", "0", "0", "--monthly", "0", today=date(2026, 10, 14))
-        saved = self.saved()["allcountry"]
-        self.assertNotIn("monthly", saved)
-        self.assertEqual(saved["orders"], [{"date": "2026-10-13", "amount": 5_000}])
-
-    def test_stopping_plan_before_order_keeps_nothing(self):
-        self.run_update("オルカン", "0", "0", "--monthly", "5,000", "--day", "10")
-        self.run_update("オルカン", "0", "0", "--monthly", "0", today=date(2026, 10, 9))
-        self.assertNotIn("orders", self.saved()["allcountry"])
-
-    def test_monthly_new_requires_monthly(self):
-        code, err = self.run_update("sp500", "1", "1", "--monthly-new")
-        self.assertEqual(code, 1)
-        self.assertIn("--monthly と一緒に", err)
+        self.assertEqual(self.saved()["sp500"]["monthly"], {"amount": 10_000, "day": 10, "since": "2026-11-20"})
+        # 同じ内容を指定し直しても設定日は変わらない
+        self.run_update("sp500", "3", "3", "--monthly", "10,000", "--day", "10", today=date(2026, 12, 20))
+        self.assertEqual(self.saved()["sp500"]["monthly"], {"amount": 10_000, "day": 10, "since": "2026-11-20"})
 
     def test_bad_input_leaves_existing_file(self):
         self.run_update("sp500", "2,202", "10,000")

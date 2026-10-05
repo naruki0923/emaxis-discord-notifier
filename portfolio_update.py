@@ -21,7 +21,6 @@ from notifier import (
     parse_holding,
     parse_holdings,
     resolve_fund_key,
-    scheduled_purchases,
 )
 
 
@@ -67,11 +66,6 @@ def main(argv: list[str] | None = None, today: date | None = None) -> int:
     parser.add_argument("values", nargs="+", metavar="[銘柄] 保有口数 取得金額")
     parser.add_argument("--monthly", help="毎月の積立金額（円）。0で積立なし")
     parser.add_argument("--day", help="毎月の積立日（1〜31）")
-    parser.add_argument(
-        "--monthly-new",
-        action="store_true",
-        help="積立を今日新しく始めた（または設定し直した）。今日より前の申込日の回は推定しない",
-    )
     parser.add_argument("--buy", help="単発の買付金額（円）。SBI証券の表示に反映されるまで推定で加算する")
     parser.add_argument(
         "--buy-date",
@@ -100,8 +94,6 @@ def main(argv: list[str] | None = None, today: date | None = None) -> int:
             parse_number(args.monthly) if args.monthly is not None else previous_monthly.get("amount", 0)
         )
         monthly_day = parse_number(args.day) if args.day is not None else previous_monthly.get("day", 0)
-        if args.monthly_new and args.monthly is None:
-            raise NotifierError("--monthly-new は --monthly と一緒に指定してください。")
 
         today = today or datetime.now(JST).date()
         # 前回までの単発の買付は、約定がSBI証券の表示に入ったかを as_of で判定するため残しておく。
@@ -111,14 +103,6 @@ def main(argv: list[str] | None = None, today: date | None = None) -> int:
             for order in (current.get(key) or {}).get("orders") or []
             if not args.clear_buys and order["date"] >= (today - timedelta(days=14)).isoformat()
         ]
-        if monthly_amount == 0 and previous_monthly.get("amount", 0) > 0:
-            # 積立をやめても、それまでに申込済みでSBIの表示に未反映の回は約定するため単発の買付として残す。
-            fund = next(f for f in FUNDS if f.key == key)
-            previous = parse_holding({**current[key], "as_of": today.isoformat(), "orders": []})
-            for purchase in scheduled_purchases(fund, previous, today, today):
-                order = {"date": purchase.order_date.isoformat(), "amount": purchase.amount}
-                if order not in orders:
-                    orders.append(order)
         if args.buy is not None:
             try:
                 buy_date = date.fromisoformat(args.buy_date) if args.buy_date else today
@@ -140,9 +124,15 @@ def main(argv: list[str] | None = None, today: date | None = None) -> int:
         }
         if monthly_amount > 0:
             entry["monthly"] = {"amount": monthly_amount, "day": monthly_day}
-            # 設定日は --monthly-new のときだけ今日にする。指定が無ければ前からある積立として扱い、
-            # 申込済みでSBIの表示に未反映の回も数える（前回の設定日は引き継ぐ）。
-            since = today.isoformat() if args.monthly_new else previous_monthly.get("since")
+            # 初回登録は前からある積立として扱い、申込済みでSBI未反映の回も数える（設定日を付けない）。
+            # 登録済みの積立は、内容が変わらなければ設定日を引き継ぎ、変更したら今日を設定日にする。
+            unchanged = (previous_monthly.get("amount"), previous_monthly.get("day")) == (monthly_amount, monthly_day)
+            if not previous_monthly:
+                since = None
+            elif unchanged:
+                since = previous_monthly.get("since")
+            else:
+                since = today.isoformat()
             if since:
                 entry["monthly"]["since"] = since
         if orders:
@@ -167,7 +157,7 @@ def main(argv: list[str] | None = None, today: date | None = None) -> int:
         f"（{entry['as_of']}時点）/ 積立: {plan}"
     )
     for order in entry.get("orders", []):
-        print(f"  単発の買付: {order['date']} 申込 {order['amount']:,}円（約定日がこの日以降なら推定で加算）")
+        print(f"  単発の買付: {order['date']} 申込 {order['amount']:,}円（約定がこの日以降なら推定で加算）")
     return 0
 
 
