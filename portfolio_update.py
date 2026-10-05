@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from notifier import (
     FUND_ALIASES,
@@ -48,7 +48,11 @@ def main() -> int:
     parser.add_argument("values", nargs="+", metavar="[銘柄] 保有口数 取得金額")
     parser.add_argument("--monthly", help="毎月の積立金額（円）。0で積立なし")
     parser.add_argument("--day", help="毎月の積立日（1〜31）")
-    parser.add_argument("--buy", help="今日注文した単発の買付金額（円）。SBI証券の表示に反映されるまで推定で加算する")
+    parser.add_argument("--buy", help="単発の買付金額（円）。SBI証券の表示に反映されるまで推定で加算する")
+    parser.add_argument(
+        "--buy-date",
+        help="--buy の申込日（YYYY-MM-DD）。省略時は今日。15:30以降の注文は翌営業日の申込になる",
+    )
     args = parser.parse_args()
 
     try:
@@ -81,7 +85,13 @@ def main() -> int:
             if order["date"] >= (today - timedelta(days=14)).isoformat()
         ]
         if args.buy is not None:
-            orders.append({"date": today.isoformat(), "amount": parse_number(args.buy)})
+            try:
+                buy_date = date.fromisoformat(args.buy_date) if args.buy_date else today
+            except ValueError as exc:
+                raise NotifierError("--buy-date は YYYY-MM-DD の形で指定してください。") from exc
+            orders.append({"date": buy_date.isoformat(), "amount": parse_number(args.buy)})
+        elif args.buy_date:
+            raise NotifierError("--buy-date は --buy と一緒に指定してください。")
 
         entry = {
             "units": parse_number(units_raw),
@@ -113,7 +123,7 @@ def main() -> int:
         f"（{entry['as_of']}時点）/ 積立: {plan}"
     )
     for order in entry.get("orders", []):
-        print(f"  単発の買付: {order['date']} 注文 {order['amount']:,}円（約定がこの時点より後なら推定で加算）")
+        print(f"  単発の買付: {order['date']} 申込 {order['amount']:,}円（約定がこの時点より後なら推定で加算）")
     return 0
 
 

@@ -15,6 +15,7 @@ from notifier import (
     Portfolio,
     build_message,
     estimate_purchases,
+    schedule_order,
     load_holdings,
     parse_holdings,
     parse_toushin_csv,
@@ -28,6 +29,15 @@ class FundPriceTest(unittest.TestCase):
         price = FundPrice(date="2026年08月14日", price=45_727, change=303)
         self.assertEqual(price.previous_price, 45_424)
         self.assertEqual(price.change_percent, Decimal("0.67"))
+
+    def test_matches_sbi_screen_on_2026_10_05(self):
+        # SBI証券: 評価額 9,833円 / 評価損益 -167円（-1.67%）/ 前日比 +32円
+        price = FundPrice(date="2026年10月02日", price=44_658, change=144)
+        portfolio = Portfolio(units=2_202, acquisition_amount=10_000)
+        self.assertEqual(portfolio.valuation(price), 9_833)
+        self.assertEqual(portfolio.profit(price), -167)
+        self.assertEqual(portfolio.profit_percent(price), Decimal("-1.67"))
+        self.assertEqual(portfolio.daily_change(price), 32)
 
     def test_portfolio_matches_sbi_screenshot(self):
         price = FundPrice(date="2026年08月14日", price=45_727, change=303)
@@ -53,7 +63,7 @@ class MessageTest(unittest.TestCase):
             FundReport(
                 SP500,
                 FundPrice(date="2026年10月02日", price=44_658, change=144),
-                Portfolio(units=2_402, acquisition_amount=12_000),
+                Portfolio(units=2_202, acquisition_amount=10_000),
             ),
             FundReport(
                 ALLCOUNTRY,
@@ -64,17 +74,17 @@ class MessageTest(unittest.TestCase):
         self.assertEqual(
             build_message(reports),
             "・資産\n"
-            "全体資産：15,728円\n"
-            "S＆P500：10,727円\n"
-            "オルカン：5,001円\n"
+            "全体資産：14,833円\n"
+            "S＆P500：9,833円\n"
+            "オルカン：5,000円\n"
             "\n"
             "・前営業日比\n"
-            "S＆P500：+35円\n"
+            "S＆P500：+32円\n"
             "オルカン：-7円\n"
             "\n"
             "・損益\n"
-            "投資金額：17,000円\n"
-            "資産：15,728円",
+            "投資金額：15,000円\n"
+            "資産：14,833円",
         )
 
     def test_missing_holding_and_error(self):
@@ -94,51 +104,86 @@ class MessageTest(unittest.TestCase):
         self.assertIn("投資金額：10,000円", message)
 
 
+class ScheduleOrderTest(unittest.TestCase):
+    def test_weekday_order(self):
+        purchase = schedule_order(SP500, date(2026, 10, 5), 10_000)
+        self.assertEqual(purchase.order_date, date(2026, 10, 5))
+        self.assertEqual(purchase.trade_date, date(2026, 10, 6))
+        self.assertEqual(purchase.settlement_date, date(2026, 10, 9))  # 申込日から5営業日目
+
+    def test_allcountry_settles_on_sixth_business_day(self):
+        purchase = schedule_order(ALLCOUNTRY, date(2026, 10, 5), 10_000)
+        self.assertEqual(purchase.trade_date, date(2026, 10, 6))
+        self.assertEqual(purchase.settlement_date, date(2026, 10, 13))  # 10/12 は祝日
+
+    def test_weekend_and_japanese_holiday_move_order_date(self):
+        # 2026/10/10(土)・11(日)・12(月・祝)
+        purchase = schedule_order(SP500, date(2026, 10, 10), 5_000)
+        self.assertEqual(purchase.order_date, date(2026, 10, 13))
+        self.assertEqual(purchase.trade_date, date(2026, 10, 14))
+
+    def test_us_market_holiday_is_not_an_order_day(self):
+        # 2026/11/26 は感謝祭（ニューヨーク証券取引所が休み）
+        purchase = schedule_order(SP500, date(2026, 11, 26), 5_000)
+        self.assertEqual(purchase.order_date, date(2026, 11, 27))
+
+    def test_allcountry_also_skips_new_york_bank_hong_kong_and_london_holidays(self):
+        # 2026/2/17〜19 は旧正月（香港）。S&P500 は申し込める。
+        self.assertEqual(schedule_order(SP500, date(2026, 2, 17), 1).order_date, date(2026, 2, 17))
+        self.assertEqual(schedule_order(ALLCOUNTRY, date(2026, 2, 17), 1).order_date, date(2026, 2, 20))
+        # 2026/8/31 はロンドンのバンクホリデー
+        self.assertEqual(schedule_order(ALLCOUNTRY, date(2026, 8, 31), 1).order_date, date(2026, 9, 1))
+        # 2026/11/11 はベテランズデー（ニューヨークの銀行休業日）
+        self.assertEqual(schedule_order(SP500, date(2026, 11, 11), 1).order_date, date(2026, 11, 11))
+        self.assertEqual(schedule_order(ALLCOUNTRY, date(2026, 11, 11), 1).order_date, date(2026, 11, 12))
+
+    def test_year_end_is_not_a_business_day(self):
+        purchase = schedule_order(SP500, date(2026, 12, 30), 1)
+        self.assertEqual(purchase.trade_date, date(2027, 1, 4))
+
+
 class EstimatePurchasesTest(unittest.TestCase):
-    # 2026年10月: 10日(土)・11日(日)・12日(月・祝)は基準価額なし
     HISTORY = [
+        (date(2026, 10, 5), 37_900),
+        (date(2026, 10, 6), 38_000),
+        (date(2026, 10, 7), 38_100),
         (date(2026, 10, 8), 37_000),
         (date(2026, 10, 9), 37_100),
         (date(2026, 10, 13), 37_200),
         (date(2026, 10, 14), 37_300),
-        (date(2026, 11, 9), 38_000),
-        (date(2026, 11, 10), 38_100),
-        (date(2026, 11, 11), 38_200),
     ]
 
-    def holding(self, as_of):
-        return Holding(units=1_000, acquisition_amount=5_000, as_of=as_of, monthly_amount=5_000, monthly_day=10)
-
-    def test_orders_next_business_day_and_trades_the_day_after(self):
-        purchases = estimate_purchases(self.holding(date(2026, 10, 5)), self.HISTORY)
-        self.assertEqual([p.date for p in purchases], [date(2026, 10, 14), date(2026, 11, 11)])
-        self.assertEqual(purchases[0].units, 5_000 * 10_000 // 37_300)
-        self.assertEqual(purchases[1].units, 5_000 * 10_000 // 38_200)
+    def test_monthly_and_one_off_orders(self):
+        holding = Holding(0, 0, date(2026, 10, 5), 5_000, 10, ((date(2026, 10, 5), 10_000),))
+        purchases = estimate_purchases(ALLCOUNTRY, holding, self.HISTORY, date(2026, 11, 30))
+        self.assertEqual(
+            [(p.trade_date, p.amount, p.price, p.units) for p in purchases],
+            [
+                (date(2026, 10, 6), 10_000, 38_000, 10_000 * 10_000 // 38_000),
+                (date(2026, 10, 14), 5_000, 37_300, 5_000 * 10_000 // 37_300),
+                (date(2026, 11, 11), 5_000, None, 0),  # 約定待ち
+            ],
+        )
 
     def test_skips_purchases_already_in_sbi_values(self):
-        purchases = estimate_purchases(self.holding(date(2026, 10, 14)), self.HISTORY)
-        self.assertEqual([p.date for p in purchases], [date(2026, 11, 11)])
-
-    def test_waits_until_trade_price_is_published(self):
-        purchases = estimate_purchases(self.holding(date(2026, 10, 5)), self.HISTORY[:3])
+        holding = Holding(0, 0, date(2026, 10, 14), 5_000, 10)
+        purchases = estimate_purchases(ALLCOUNTRY, holding, self.HISTORY, date(2026, 10, 31))
         self.assertEqual(purchases, [])
 
-    def test_one_off_order_is_added_after_trade(self):
-        holding = Holding(units=0, acquisition_amount=0, as_of=date(2026, 10, 9), orders=((date(2026, 10, 9), 10_000),))
-        purchases = estimate_purchases(holding, self.HISTORY[:3])
-        self.assertEqual(purchases, [notifier.Purchase(date(2026, 10, 13), 10_000, 10_000 * 10_000 // 37_200)])
-        self.assertEqual(estimate_purchases(holding, self.HISTORY[:2]), [])
+    def test_waits_until_trade_price_is_published(self):
+        holding = Holding(0, 0, date(2026, 10, 5), 5_000, 10)
+        purchases = estimate_purchases(ALLCOUNTRY, holding, self.HISTORY[:5], date(2026, 10, 31))
+        self.assertEqual([(p.trade_date, p.price) for p in purchases], [(date(2026, 10, 14), None)])
 
-    def test_one_off_order_and_monthly_plan_together(self):
-        holding = Holding(0, 0, date(2026, 10, 5), 5_000, 10, ((date(2026, 10, 5), 10_000),))
-        purchases = estimate_purchases(holding, [(date(2026, 10, 5), 37_000), (date(2026, 10, 6), 37_500)] + self.HISTORY)
-        self.assertEqual([(p.date, p.amount) for p in purchases], [
-            (date(2026, 10, 6), 10_000), (date(2026, 10, 14), 5_000), (date(2026, 11, 11), 5_000),
-        ])
+    def test_missing_trade_price_is_an_error(self):
+        holding = Holding(0, 0, date(2026, 10, 5), 5_000, 10)
+        history = [h for h in self.HISTORY if h[0] != date(2026, 10, 14)] + [(date(2026, 10, 15), 1)]
+        with self.assertRaises(NotifierError):
+            estimate_purchases(ALLCOUNTRY, holding, history, date(2026, 10, 31))
 
-    def test_no_estimate_without_monthly_plan(self):
+    def test_no_estimate_without_plan(self):
         holding = Holding(units=1_000, acquisition_amount=5_000, as_of=date(2026, 10, 5))
-        self.assertEqual(estimate_purchases(holding, self.HISTORY), [])
+        self.assertEqual(estimate_purchases(SP500, holding, self.HISTORY, date(2026, 12, 31)), [])
 
 
 class HoldingsTest(unittest.TestCase):
@@ -183,22 +228,14 @@ class BuildReportTest(unittest.TestCase):
     def test_adds_estimated_purchases_to_holding(self):
         holding = Holding(1_000, 5_000, date(2026, 10, 5), 5_000, 10)
         price = FundPrice(date="2026年10月14日", price=37_300, change=100)
+        history = EstimatePurchasesTest.HISTORY[:6]  # 投資信託協会は10/14分がまだ無い
         with mock.patch.object(notifier, "fetch_fund_price", return_value=price), mock.patch.object(
-            notifier, "fetch_price_history", return_value=EstimatePurchasesTest.HISTORY[:4]
+            notifier, "fetch_price_history", return_value=history
         ):
-            report = notifier.build_report(ALLCOUNTRY, holding)
+            report = notifier.build_report(ALLCOUNTRY, holding, today=date(2026, 10, 15))
         self.assertEqual(report.portfolio, Portfolio(1_000 + 5_000 * 10_000 // 37_300, 10_000))
-
-
-class DailyChangeTest(unittest.TestCase):
-    def test_units_bought_on_price_date_have_no_daily_change(self):
-        report = FundReport(
-            ALLCOUNTRY,
-            FundPrice(date="2026年10月06日", price=38_000, change=100),
-            Portfolio(units=3_631, acquisition_amount=14_000),
-            (notifier.Purchase(date(2026, 10, 6), 10_000, 2_631),),
-        )
-        self.assertEqual(report.daily_change(), 10)
+        # 約定した当日の口数は前営業日比に含めない
+        self.assertEqual(report.daily_change(), 1_000 * 37_300 // 10_000 - 1_000 * 37_200 // 10_000)
 
 
 class ToushinCsvTest(unittest.TestCase):

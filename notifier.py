@@ -13,6 +13,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from functools import lru_cache
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
@@ -34,6 +35,10 @@ class Fund:
     mufg_code: str
     isin: str
     association_code: str
+    # 購入代金の受渡日（申込日から起算して何営業日目か）
+    settlement_business_day: int
+    # 購入申込不可日の元になる海外の休業日カレンダー（closed_days の名前）
+    closed_calendars: tuple[str, ...]
 
     @property
     def api_url(self) -> str:
@@ -56,6 +61,9 @@ FUNDS = (
         mufg_code="253266",
         isin="JP90C000GKC6",
         association_code="03311187",
+        settlement_business_day=5,
+        # ニューヨーク証券取引所の休業日
+        closed_calendars=("NYSE",),
     ),
     Fund(
         key="allcountry",
@@ -64,6 +72,9 @@ FUNDS = (
         mufg_code="253425",
         isin="JP90C000H1T1",
         association_code="0331418A",
+        settlement_business_day=6,
+        # ニューヨーク・ロンドン・香港の各証券取引所と銀行の休業日
+        closed_calendars=("NYSE", "US", "GB", "HK"),
     ),
 )
 FUND_ALIASES = {
@@ -103,13 +114,12 @@ class Portfolio:
     units: int
     acquisition_amount: int
 
+    # SBI証券の表示に合わせ、評価額は1円未満を切り捨て、前日比は評価額どうしの差にする。
     def valuation(self, price: FundPrice) -> int:
-        value = Decimal(price.price) * Decimal(self.units) / Decimal(10_000)
-        return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        return self.units * price.price // 10_000
 
     def daily_change(self, price: FundPrice) -> int:
-        value = Decimal(price.change) * Decimal(self.units) / Decimal(10_000)
-        return int(value.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        return self.valuation(price) - self.units * price.previous_price // 10_000
 
     def profit(self, price: FundPrice) -> int:
         return self.valuation(price) - self.acquisition_amount
@@ -130,15 +140,24 @@ class Holding:
     as_of: date | None = None
     monthly_amount: int = 0
     monthly_day: int = 0
-    # 積立以外の単発の買付（注文日, 金額）。SBI証券の表示に反映される前の分を推定するために使う。
+    # 積立以外の単発の買付（申込日, 金額）。SBI証券の表示に反映される前の分を推定するために使う。
     orders: tuple[tuple[date, int], ...] = ()
 
 
 @dataclass(frozen=True)
 class Purchase:
-    date: date
+    order_date: date
+    trade_date: date
+    settlement_date: date
     amount: int
-    units: int
+    # 約定日の基準価額が公表されるまでは None
+    price: int | None = None
+
+    @property
+    def units(self) -> int:
+        if self.price is None:
+            return 0
+        return self.amount * 10_000 // self.price
 
 
 @dataclass(frozen=True)
@@ -153,7 +172,7 @@ class FundReport:
         if self.portfolio is None:
             return 0
         price_date = parse_japanese_date(self.price.date)
-        new_units = sum(p.units for p in self.purchases if p.date >= price_date)
+        new_units = sum(p.units for p in self.purchases if p.trade_date >= price_date)
         held = Portfolio(self.portfolio.units - new_units, self.portfolio.acquisition_amount)
         return held.daily_change(self.price)
 
@@ -282,34 +301,94 @@ def fetch_fund_price_from_mufg(fund: Fund) -> FundPrice:
     return FundPrice(date=date_str, price=price, change=change)
 
 
-def estimate_purchases(holding: Holding, history: list[tuple[date, int]]) -> list[Purchase]:
-    """as_of より後に約定した積立・単発の買付を、公開されている基準価額から推定する。
+@lru_cache(maxsize=None)
+def closed_days(calendar_name: str, year: int) -> frozenset[date]:
+    try:
+        import holidays
+    except ImportError as exc:
+        raise NotifierError(
+            "休業日の判定に holidays が必要です。python3 -m pip install -r requirements.txt を実行してください。"
+        ) from exc
+    # 取引所の休業日は、各地の銀行休業日とほぼ重なるため国・地域の祝日で代用する
+    # （Python 3.9 で入る版の holidays にはロンドン・香港・東京の取引所カレンダーが無い）。
+    if calendar_name == "NYSE":
+        days = set(holidays.financial_holidays("NYSE", years=year))
+    elif calendar_name == "GB":
+        days = set(holidays.country_holidays("GB", subdiv="ENG", years=year))
+    elif calendar_name == "HK":
+        days = set(holidays.country_holidays("HK", years=year, categories=("public", "optional")))
+    elif calendar_name == "JP":
+        # 投資信託は年末年始（12/31〜1/3）も休業日
+        days = set(holidays.country_holidays("JP", years=year))
+        days |= {date(year, 12, 31), date(year, 1, 2), date(year, 1, 3)}
+    else:
+        days = set(holidays.country_holidays(calendar_name, years=year))
+    return frozenset(days)
 
-    注文日（休日なら翌営業日）の翌営業日の基準価額で約定する前提。
-    営業日は基準価額が公表された日で判定する。約定日の基準価額がまだ無い回は数えない。
+
+def is_business_day(day: date) -> bool:
+    """国内の営業日（土日・祝日・年末年始を除く）。"""
+    return day.weekday() < 5 and day not in closed_days("JP", day.year)
+
+
+def is_order_day(fund: Fund, day: date) -> bool:
+    return is_business_day(day) and not any(day in closed_days(name, day.year) for name in fund.closed_calendars)
+
+
+def next_business_day(day: date) -> date:
+    day += timedelta(days=1)
+    while not is_business_day(day):
+        day += timedelta(days=1)
+    return day
+
+
+def schedule_order(fund: Fund, requested: date, amount: int) -> Purchase:
+    """申込日（休日・申込不可日なら次に申し込める日）から、約定日と受渡日を決める。
+
+    約定は申込日の翌営業日の基準価額で行われ、購入代金は申込日から起算して
+    fund.settlement_business_day 営業日目に受け渡す。
     """
-    if holding.as_of is None or not history:
+    order_date = requested
+    while not is_order_day(fund, order_date):
+        order_date += timedelta(days=1)
+    trade_date = next_business_day(order_date)
+    settlement_date = order_date
+    for _ in range(fund.settlement_business_day - 1):
+        settlement_date = next_business_day(settlement_date)
+    return Purchase(order_date, trade_date, settlement_date, amount)
+
+
+def estimate_purchases(
+    fund: Fund, holding: Holding, history: list[tuple[date, int]], until: date
+) -> list[Purchase]:
+    """as_of より後に約定する積立・単発の買付を、申込日が until までの分だけ並べる。
+
+    約定日の基準価額が history にあれば price を埋める（口数を推定できる）。
+    まだ無いものは price=None の約定待ちとして返す。
+    """
+    if holding.as_of is None:
         return []
 
-    history = sorted(history)
-    dates = [d for d, _ in history]
-    orders = list(holding.orders)
+    requests = list(holding.orders)
     if holding.monthly_amount > 0:
         year, month = holding.as_of.year, holding.as_of.month
-        while (year, month) <= (dates[-1].year, dates[-1].month):
+        while date(year, month, 1) <= until:
             day = min(holding.monthly_day, calendar.monthrange(year, month)[1])
-            orders.append((date(year, month, day), holding.monthly_amount))
+            requests.append((date(year, month, day), holding.monthly_amount))
             year, month = (year + 1, 1) if month == 12 else (year, month + 1)
 
+    prices = dict(history)
+    last_priced = max(prices) if prices else None
     purchases: list[Purchase] = []
-    for order_date, amount in orders:
-        order_index = next((i for i, d in enumerate(dates) if d >= order_date), None)
-        if order_index is None or order_index + 1 >= len(dates):
+    for requested, amount in requests:
+        purchase = schedule_order(fund, requested, amount)
+        if purchase.order_date > until or purchase.trade_date <= holding.as_of:
             continue
-        trade_date, price = history[order_index + 1]
-        if trade_date > holding.as_of:
-            purchases.append(Purchase(date=trade_date, amount=amount, units=amount * 10_000 // price))
-    return sorted(purchases, key=lambda p: p.date)
+        price = prices.get(purchase.trade_date)
+        if price is None and last_priced is not None and last_priced > purchase.trade_date:
+            raise NotifierError(f"約定日 {purchase.trade_date} の基準価額が見つかりません。")
+        purchases.append(Purchase(purchase.order_date, purchase.trade_date, purchase.settlement_date, amount, price))
+    return sorted(purchases, key=lambda p: p.trade_date)
 
 
 def resolve_fund_key(name: str) -> str:
@@ -379,17 +458,23 @@ def load_holdings() -> dict[str, Holding]:
     return parse_holdings(data)
 
 
-def build_report(fund: Fund, holding: Holding | None) -> FundReport:
+def build_report(fund: Fund, holding: Holding | None, today: date | None = None) -> FundReport:
     price = fetch_fund_price(fund)
     if holding is None:
         return FundReport(fund, price)
 
     purchases: list[Purchase] = []
     if (holding.monthly_amount > 0 or holding.orders) and holding.as_of is not None:
-        purchases = estimate_purchases(holding, fetch_price_history(fund))
+        today = today or datetime.now(JST).date()
+        # 投資信託協会のデータは公式サイトより1日遅れることがあるため、最新の基準価額を足しておく。
+        history = dict(fetch_price_history(fund))
+        history.setdefault(parse_japanese_date(price.date), price.price)
+        # 次回の約定待ちも --dry-run で見られるよう、少し先の申込まで並べる。
+        purchases = estimate_purchases(fund, holding, sorted(history.items()), today + timedelta(days=31))
+    priced = [p for p in purchases if p.price is not None]
     portfolio = Portfolio(
-        units=holding.units + sum(p.units for p in purchases),
-        acquisition_amount=holding.acquisition_amount + sum(p.amount for p in purchases),
+        units=holding.units + sum(p.units for p in priced),
+        acquisition_amount=holding.acquisition_amount + sum(p.amount for p in priced),
     )
     return FundReport(fund, price, portfolio, tuple(purchases))
 
@@ -490,8 +575,12 @@ def print_details(reports: list[FundReport], errors: list[tuple[Fund, str]]) -> 
                 f"  保有 {portfolio.units:,}口 / 取得金額 {portfolio.acquisition_amount:,}円"
                 f" / 評価損益 {signed(portfolio.profit(price))}円"
             )
-        for purchase in report.purchases:
-            print(f"  買付（推定）: {purchase.date} 約定 {purchase.amount:,}円 → {purchase.units:,}口")
+        for p in report.purchases:
+            dates = f"申込日 {p.order_date} / 約定日 {p.trade_date} / 受渡日 {p.settlement_date}"
+            if p.price is None:
+                print(f"  買付 {p.amount:,}円（約定待ち）: {dates}")
+            else:
+                print(f"  買付 {p.amount:,}円 → {p.units:,}口（推定・基準価額 {p.price:,}円）: {dates}")
     for fund, message in errors:
         print(f"[{fund.name}] エラー: {message}")
     print()

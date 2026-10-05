@@ -6,7 +6,7 @@ readonly PORTFOLIO_PATH="$PROJECT_DIR/portfolio.json"
 
 usage() {
   cat <<'EOF'
-使い方: ./update.sh <銘柄> <保有口数> <取得金額> [--monthly 積立金額 --day 積立日] [--buy 買付金額] [--notify]
+使い方: ./update.sh <銘柄> <保有口数> <取得金額> [--monthly 積立金額 --day 積立日] [--buy 買付金額 [--buy-date 申込日]] [--notify]
 
 SBI証券の最新表示に合わせて、1銘柄分の保有口数と取得金額を更新します。
 GitHub Secrets（PORTFOLIO_JSON）とローカルのportfolio.jsonの両方に反映します。
@@ -14,7 +14,8 @@ GitHub Secrets（PORTFOLIO_JSON）とローカルのportfolio.jsonの両方に�
 
 例: ./update.sh sp500 2,402 12,000
     ./update.sh オルカン 1,320 5,000 --monthly 5,000 --day 10
-    ./update.sh オルカン 1,320 5,000 --buy 10,000   # 今日注文した買付（約定後に推定で加算）
+    ./update.sh オルカン 1,320 5,000 --buy 10,000   # 今日申し込んだ買付（約定後に推定で加算）
+    ./update.sh オルカン 1,320 5,000 --buy 10,000 --buy-date 2026-10-06
     ./update.sh sp500 2,402 12,000 --notify   # 更新後すぐにDiscordへ通知する
 EOF
 }
@@ -40,6 +41,10 @@ if ! command -v gh >/dev/null 2>&1; then
 fi
 
 cd "$PROJECT_DIR"
+if ! python3 -c 'import holidays' 2>/dev/null; then
+  echo "休業日の判定に使うライブラリを入れます: python3 -m pip install --user -r requirements.txt"
+  python3 -m pip install --user -q -r requirements.txt
+fi
 REPO="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
 
 python3 portfolio_update.py "${ARGS[@]}"

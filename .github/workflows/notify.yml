@@ -21,6 +21,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: 休業日判定のライブラリを入れる
+        run: python3 -m pip install -r requirements.txt
+
       - name: 基準価額を取得してDiscordへ通知
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
